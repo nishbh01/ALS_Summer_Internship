@@ -1,0 +1,373 @@
+---
+title: "De_convolution All methods"
+author: "Nischal Bhandari"
+date: "7/6/2023"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r warning=FALSE, include=FALSE}
+library(MuSiC)
+library(tidyverse)
+library(ggplot2)
+library(Biobase)
+library(Seurat)
+library(SingleCellExperiment)
+library(SummarizedExperiment)
+# install the MuSiC2 package
+if (!"MuSiC2" %in% rownames(installed.packages())) {
+  devtools::install_github("Jiaxin-Fan/MuSiC2")
+}
+library(MuSiC2)
+devtools::install_github("smin95/smplot2")
+library(smplot2)
+```
+
+```{r}
+# exploring single cell data
+spinal_single <- readRDS("Single_SpinalCord.rds")
+
+
+unique(spinal_single$Cell_Subtype)
+# filtering out all the cell subtypes that are labelled as "Missing" and others
+spinal_single$Cell_Subtype <- sub("_.*", "", spinal_single$Cell_Subtype)
+spinal_single <- subset(spinal_single, Cell_Subtype == c("Astrocyte", "Endothelial", "Excitatory", "Inhibitory", "Microglia", "Oligo"))
+spinal_single[["cell_names"]] <- colnames(spinal_single)
+```
+
+```{r}
+# exploring single cell data
+p1 <- DimPlot(spinal_single, reduction = "umap", group.by = "Cell_Subtype", label = TRUE)
+p1 + theme(legend.position = "NONE")
+```
+
+```{r}
+count_cell_type <- spinal_single@meta.data %>%
+  group_by(Cell_Subtype, segment) %>%
+  summarize(count = n())
+arrange(count_cell_type, desc(count))
+```
+```{r}
+ggplot(count_cell_type, aes(Cell_Subtype, count, fill = segment)) +
+  geom_col()
+```
+
+Selecting only 2000 cells per cell type for faster deconvolution
+
+```{r}
+cells_to_keep <- spinal_single@meta.data %>%
+  group_by(Cell_Subtype) %>%
+  sample_n(min(n(), 2000))
+
+
+# Get the row names from the data frame
+cells_to_keep <- cells_to_keep$cell_names
+
+# Subset the Seurat object using these cells
+subset_spinal_single <- subset(spinal_single, cells = cells_to_keep)
+# now let's see the cluster
+
+p2 <- DimPlot(subset_spinal_single, reduction = "umap", group.by = "Cell_Subtype", label = TRUE)
+```
+
+```{r}
+# changing the single cell SO to SCE
+singlespinal.sce <- as.SingleCellExperiment(subset_spinal_single)
+```
+Reading bulk data
+
+```{r}
+spinalled <- readRDS("bulk_spinal_expression_matrix.Rds")
+
+
+final_spinalled_ematrix <- exprs(spinalled) # exprs(final_spinalled_ematrix)
+colnames(final_spinalled_ematrix) <- gsub("[.]", "-", colnames(final_spinalled_ematrix))
+```
+# load the metadata
+```{r}
+meta_data <- read.csv("meta_data_for_bulk.csv")
+meta_data$X <- NULL
+
+# different matrix for control and ALS samples
+als_mnd <- filter(meta_data, Subject.Group == "ALS Spectrum MND")
+als_mnd_sample_names <- als_mnd$Samples
+
+control <- meta_data[meta_data$Subject.Group == "Non-Neurological Control", ]
+control_sample_names <- control$Samples
+```
+
+
+```{r}
+bulk_control <- final_spinalled_ematrix[, colnames(final_spinalled_ematrix) %in% control_sample_names]
+bulk_case <- final_spinalled_ematrix[, colnames(final_spinalled_ematrix) %in% als_mnd_sample_names]
+```
+
+```{r, cache=TRUE}
+library(rtracklayer)
+library(SummarizedExperiment)
+
+# music2
+final_prop_est <- music2_prop_t_statistics(
+  bulk.control.mtx = bulk_control,
+  bulk.case.mtx = bulk_case, sc.sce = singlespinal.sce,
+  clusters = "Cell_Subtype", samples = "patient",
+  select.ct = c("Astrocyte", "Oligo", "Microglia", "Endothelial", "Inhibitory", "Excitatory"), n_resample = 20, sample_prop = 0.5, cutoff_c = 0.05, cutoff_r = 0.01
+)
+
+
+
+spinal_prop <- final_prop_est$Est.prop
+cell_type_specific_genes <- final_prop_est$DE.genes
+```
+
+```{r}
+# simple plot
+jitter.fig <- Jitter_Est(data.matrix(spinal_prop),
+  method.name = "MuSiC2", title = "Jitter plot of Est Proportions"
+)
+```
+```{r}
+# plot estimated cell type proportions
+prop_all <- cbind("proportion" = c(spinal_prop), "sampleID" = rep(rownames(spinal_prop), times = ncol(spinal_prop)), "celltype" = rep(colnames(spinal_prop), each = nrow(spinal_prop)))
+
+prop_all <- as.data.frame(prop_all)
+prop_all$proportion <- as.numeric(as.character(prop_all$proportion))
+
+prop_all$group <- ifelse(prop_all$sampleID %in% als_mnd_sample_names, "ALS", "Healthy")
+
+
+cols <- c(
+  "Microglia" = "cadetblue2", "Astrocyte" = "lightsalmon1", "Oligo" = "palegreen2", "Inhibitory" = "goldenrod1",
+  "Excitatory" = "steelblue3"
+)
+ggplot(prop_all, aes(x = celltype, y = proportion, color = celltype)) +
+  xlab("") +
+  geom_boxplot() +
+  geom_jitter(width = 0.25, alpha = 0.8) +
+  ylab("Cell Type Proportions") +
+  theme_bw() +
+  stat_summary(
+    fun = median,
+    geom = "crossbar", width = 0.5, size = 0.5, color = "red"
+  ) +
+  facet_grid(. ~ group) +
+  theme(
+    plot.title = element_text(hjust = 0.5, size = 12),
+    axis.text.x = element_text(size = 12, angle = 45, hjust = 1),
+    axis.text.y = element_text(size = 12),
+    axis.title.x = element_text(size = 12),
+    axis.title.y = element_text(size = 12),
+    axis.line = element_line(colour = "black"),
+    strip.text.x = element_text(size = 12),
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    panel.border = element_blank(),
+    panel.background = element_blank(),
+    legend.position = "none"
+  ) +
+  scale_color_manual(values = cols)
+```
+
+Load cibersortx files here
+
+```{r}
+# clean the data
+cibersortx_est <- read.csv("CIBERSORTx_Job5_Results.csv")
+control_healthy <- c(als_mnd_sample_names, control_sample_name)
+cibersortx_est <- subset(cibersortx_est, Mixture %in% control_healthy)
+cibersortx_est <- cibersortx_est[, 1:7]
+rownames(cibersortx_est) <- cibersortx_est$Mixture
+cibersortx_est$Mixture <- NULL
+cibersortx_est <- as.matrix(cibersortx_est)
+```
+
+
+
+```{r}
+ALL <- cbind(prop_all[, -4], "Method" = "MuSiC2")
+# Now, MuSiC
+bulk_control_healthy <- final_spinalled_ematrix
+bulk_control_healthy <- bulk_control_healthy[, colnames(bulk_control_healthy) %in% c(control_sample_names, als_mnd_sample_names)]
+prop_music <- music_prop(
+  bulk.mtx = bulk_control_healthy, sc.sce = singlespinal.sce,
+  clusters = "Cell_Subtype", samples = "segment",
+  select.ct = c("Astrocyte", "Oligo", "Microglia", "Endothelial", "Inhibitory", "Excitatory"), verbose = F
+)
+
+music_predicted <- prop_music$Est.prop.weighted
+nnls_predicted <- prop_music$Est.prop.allgene
+
+
+
+prop_all_m <- cbind("proportion" = c(music_predicted), "celltype" = rep(colnames(music_predicted), each = nrow(music_predicted)), "sampleID" = rep(rownames(music_predicted), times = ncol(music_predicted)), "Method" = "MuSiC")
+prop_all_n <- cbind("proportion" = c(nnls_predicted), "celltype" = rep(colnames(nnls_predicted), each = nrow(nnls_predicted)), "sampleID" = rep(rownames(nnls_predicted), times = ncol(nnls_predicted)), "Method" = "NNLS")
+
+prop_all_m <- as.data.frame(prop_all_m)
+prop_all_n <- as.data.frame(prop_all_n)
+prop_all_m$proportion <- as.numeric(as.character(prop_all_m$proportion))
+prop_all_n$proportion <- as.numeric(as.character(prop_all_n$proportion))
+
+prop_all_cibersort <- cbind("proportion" = c(cibersortx_est), "celltype" = rep(colnames(cibersortx_est), each = nrow(cibersortx_est)), "sampleID" = rep(rownames(cibersortx_est), times = ncol(cibersortx_est)), "Method" = "CIBERSORTX")
+prop_all_cibersort <- as.data.frame(prop_all_cibersort)
+prop_all_cibersort$proportion <- as.numeric(as.character(prop_all_cibersort$proportion))
+
+# combine all the methods result
+ALL <- rbind(ALL, prop_all_m, prop_all_n, prop_all_cibersort)
+
+ALL$group <- ifelse(ALL$sampleID %in% control_sample_names, "Healthy", "ALS")
+ALL$Method <- factor(ALL$Method, levels = c("CIBERSORTX", "MuSiC2", "MuSiC", "NNLS"))
+```
+
+Visualize all the cell type estimations from 2000 cells per cell type of single cell reference
+
+```{r}
+p1 <- ggplot(ALL, aes(celltype, proportion, fill = group)) +
+  geom_boxplot(color = "black", outlier.shape = NA) +
+  facet_wrap(~Method) +
+  theme(axis.text.x = element_text(size = 12, angle = 45, hjust = 1))
+```
+```{r}
+median_summaries_2000 <- ALL %>%
+  group_by(celltype, Method) %>%
+  summarize(median_estimation = median(proportion))
+```
+```{r}
+meta_filtered <- subset_spinal_single@meta.data
+meta_filtered <- as.data.frame(meta_filtered)
+
+total_cell_count <- meta_filtered %>%
+  group_by(Cell_Subtype) %>%
+  summarize(total = n())
+```
+
+Correlation between cibersortx and music2
+```{r}
+Cibsersortx <- ALL[ALL$Method == "CIBERSORTX", ]
+Music2 <- ALL[ALL$Method == "MuSiC2", ]
+
+cor(Cibsersortx$proportion, Music2$proportion)
+
+ggplot(ALL, aes(proportion, proportion)) +
+  geom_point(data = subset(ALL, Method == "CIBERSORTX"), color = "blue") +
+  geom_point(data = subset(ALL, Method == "MuSiC2"), color = "red") +
+  facet_grid(Method ~ ., switch = "y") +
+  theme_bw()
+```
+
+
+Comparing with 18k+ cells vs 6k cells
+
+```{r}
+library(reshape2)
+# all cells
+music_2_est <- read.csv("als_helthy_proportion_music2.CSV")
+music_2_est$X <- NULL
+colnames(music_2_est)[1] <- "proportion_all"
+# 6k cells
+music_2_est_6k <- readRDS("cell_types_prediction_6K.rds")
+music_2_est_6k <- music_2_est_6k$Est.prop.weighted
+rownames(music_2_est_6k) <- gsub("[.]", "-", rownames(music_2_est_6k))
+music_2_est_6k <- as.data.frame(music_2_est_6k)
+music_2_est_6k$sampleID <- rownames(music_2_est_6k)
+rownames(music_2_est_6k) <- NULL
+music_2_est_6k <- melt(music_2_est_6k, id.vars = "sampleID")
+colnames(music_2_est_6k)[2] <- "celltype"
+colnames(music_2_est_6k)[3] <- "proportion"
+prop_all <- music_2_est_6k
+
+prop_all <- as.data.frame(prop_all)
+prop_all$proportion <- as.numeric(as.character(prop_all$proportion))
+prop_all <- subset(prop_all, sampleID %in% c(als_mnd_sample_names, control_sample_names))
+music_2_est <- music_2_est[, -4]
+
+# match the cells sample IDs into two dataframes
+
+
+all_vs_6k <- merge(prop_all, music_2_est, by = c("celltype", "sampleID"))
+```
+plot a graph for all(18k+ cells) and (6K cells)
+```{r}
+correlation_coefficient <- cor(all_vs_6k$proportion, all_vs_6k$proportion_all)
+p_value <- wilcox.test(all_vs_6k$proportion, all_vs_6k$proportion_all, paired = TRUE, alternative = "two.sided")
+p_value <- p_value$p.value
+
+p1 <- ggplot(all_vs_6k, aes(proportion_all, proportion)) +
+  geom_point(color = "red") +
+  geom_smooth(method = "lm") +
+  labs(
+    x = "MuSiC2: estimations using 18,983 Cells",
+    y = "MuSiC2: estimations using 6k cells",
+    title = "MuSiC2 estimations"
+  ) +
+  theme_classic() +
+  theme(plot.title = element_text(face = "bold")) +
+  scale_y_continuous(labels = scales::percent_format(accuracy = 1), limits = c(0, 1)) +
+  scale_x_continuous(labels = scales::percent_format(accuracy = 1), limits = c(0, 1)) +
+  annotate(
+    "text",
+    x = 0.1, y = 0.9,
+    label = paste("p-value =", round(p_value, 3)),
+    size = 4, hjust = 0, vjust = 0
+  ) +
+  annotate(
+    "text",
+    x = 0.1, y = 0.83,
+    label = paste("Pearson's r =", round(correlation_coefficient, 3)),
+    size = 4, hjust = 0, vjust = 0
+  )
+ggsave(p1, filename = "18K_6k_music2.jpeg", dpi = 300, height = 3, width = 4)
+```
+
+Now with MuSiC
+```{r}
+# music with 18983 vs 6000
+
+music_nnls <- readRDS("MuSiC_NNLS_ALS_Healthy_Results.rds")
+music_est <- music_nnls$Est.prop.weighted
+prop_all_m <- cbind("proportion" = c(music_est), "celltype" = rep(colnames(music_est), each = nrow(music_est)), "sampleID" = rep(rownames(music_est), times = ncol(music_est)), "Method" = "MuSiC")
+prop_all_m <- as.data.frame(prop_all_m)
+prop_all_m$proportion <- as.numeric(as.character(prop_all_m$proportion))
+
+# 6000
+prop_music <- readRDS("music_filtered_cell_types_prediction_humphrey_6K.rds")
+music_predicted <- prop_music$Est.prop.weighted
+prop_all_m_2 <- cbind("proportion" = c(music_predicted), "celltype" = rep(colnames(music_predicted), each = nrow(music_predicted)), "sampleID" = rep(rownames(music_predicted), times = ncol(music_predicted)), "Method" = "MuSiC")
+prop_all_m_2 <- as.data.frame(prop_all_m_2)
+prop_all_m_2$proportion <- as.numeric(as.character(prop_all_m_2$proportion))
+prop_all_m_2$sampleID <- gsub("[.]", "-", prop_all_m_2$sampleID)
+colnames(prop_all_m_2)[1] <- "prop2"
+
+merged_proportions <- merge(prop_all_m, prop_all_m_2, by = c("celltype", "sampleID", "Method"))
+correlation_coefficient <- cor(merged_proportions$proportion, merged_proportions$prop2)
+p_value <- wilcox.test(merged_proportions$proportion, merged_proportions$prop2, paired = TRUE, alternative = "two.sided")
+p_value <- p_value$p.value
+
+p2 <- ggplot(merged_proportions, aes(proportion, prop2)) +
+  geom_point(color = "red") +
+  geom_smooth(method = "lm") +
+  labs(
+    x = "MuSiC: estimations using 18,983 Cells",
+    y = "MuSiC: estimations using 6k cells",
+    title = "MuSiC estimations"
+  ) +
+  theme_classic() +
+  theme(plot.title = element_text(face = "bold")) +
+  scale_y_continuous(labels = scales::percent_format(accuracy = 1), limits = c(0, 1)) +
+  scale_x_continuous(labels = scales::percent_format(accuracy = 1), limits = c(0, 1)) +
+  annotate(
+    "text",
+    x = 0.1, y = 0.9,
+    label = paste("p-value =", round(p_value, 3)),
+    size = 4, hjust = 0, vjust = 0
+  ) +
+  annotate(
+    "text",
+    x = 0.1, y = 0.80,
+    label = paste("Pearson's r =", round(correlation_coefficient, 3)),
+    size = 4, hjust = 0, vjust = 0
+  )
+ggsave(p2, filename = "18K_6k_music.jpeg", dpi = 300, height = 3, width = 4)
+```
