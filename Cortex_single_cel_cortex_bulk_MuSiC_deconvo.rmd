@@ -1,0 +1,405 @@
+---
+title: "Single_Cell_Cortex"
+author: "Nischal Bhandari"
+date: "7/11/2023"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+```{r}
+library(Seurat)
+```
+Load the data
+```{r}
+count_matrix <- Matrix::readMM("filtered_count_matrix.mtx")
+gene_names <- read.table("filtered_gene_row_names.txt", header = FALSE)
+meta_data <- read.table("filtered_column_metadata.txt", header = TRUE)
+rownames(meta_data) <- meta_data$TAG
+```
+
+Name the rows and colmnames
+```{r}
+dimnames(count_matrix) <- list(gene_names$V1, meta_data$TAG)
+```
+
+
+Create the seurat object for cortex single cell data.
+```{r}
+cortex_single <- CreateSeuratObject(counts = count_matrix, min.cells = 3, min.features = 300)
+cortex_single[["percent.mt"]] <- PercentageFeatureSet(cortex_single, pattern = "^MT-")
+VlnPlot(cortex_single, features = c("nFeature_RNA", "nCount_RNA", "percent.mt"), ncol = 3, pt.size = 0.1) + NoLegend()
+```
+
+Add the metadata
+
+```{r}
+cortex_single <- AddMetaData(cortex_single, metadata = meta_data)
+```
+
+```{r}
+# variable features
+cortex_single <- NormalizeData(cortex_single)
+cortex_single <- FindVariableFeatures(cortex_single, selection.method = "vst", nfeatures = 2000)
+
+# scale the data
+all.genes <- rownames(cortex_single)
+cortex_single <- ScaleData(cortex_single) #,features = all.genes)
+
+# RUN pcas
+cortex_single <- RunPCA(cortex_single, features = VariableFeatures(object = cortex_single))
+VizDimLoadings(cortex_single, dims = 1:2, reduction = "pca")
+
+#plot pcas
+DimPlot(cortex_single, reduction = "pca", group.by = 'broad.cell.type')
+
+```
+Find neighbors
+```{r}
+cortex_single <- FindNeighbors(cortex_single, dims = 1:50)
+
+# Run UMAP
+cortex_single <- RunUMAP(cortex_single, dims = 1:50)
+
+# Plot UMAPs
+p1 <- DimPlot(cortex_single, reduction = "umap", group.by = 'Subcluster')
+
+# save the RDS
+saveRDS(cortex_single, "cortex_single_seurat.rds")
+cortex_single <- readRDS("cortex_single_seurat.rds")
+```
+
+```{r}
+# select_type <- c("Ast", "End", "Ex", "In", "Mic", "Oli")
+saveRDS(cortex_single, "cortex_single_seurat.rds")
+
+```
+
+Run Deconvolution Using scCortex Sample and MuSiC
+
+```{r}
+library(MuSiC)
+
+library(SummarizedExperiment)
+library(tidyr)
+library(dplyr)
+library(ggplot2)
+```
+
+```{r}
+# relable the short names
+# merge cells into neurons
+cortex_single@meta.data <- cortex_single@meta.data %>%
+  mutate(broad.cell.type = case_when(
+     broad.cell.type == "Oli" ~ "Oligodendrocytes",
+    broad.cell.type %in% c("In", "Ex") ~ "Neurons",
+    broad.cell.type == "Mic" ~ "Microglia",
+    broad.cell.type == "Ast" ~ "Astrocytes",
+    broad.cell.type == "End" ~ "Endothelial",
+    broad.cell.type == "Per" ~ "Pericytes",
+    TRUE ~ broad.cell.type 
+  ))
+```
+
+```{r}
+count_cell_type <- cortex_single@meta.data %>%
+  group_by(broad.cell.type) %>%
+  summarize(count = n())
+count_cell_type[order(count_cell_type$count, decreasing = TRUE), ]
+```
+
+```{r}
+# changing the single cell SO to SCE
+singlecortex.sce <- as.SingleCellExperiment(cortex_single)
+```
+Reading bulk data
+
+```{r}
+
+all_bulk_samples <- load("/bulk_matrix.RData")
+all_bulk_samples <- genes_counts
+all_bulk_samples$gene <- rownames(all_bulk_samples)
+all_bulk_samples$gene <- sub("\\..*$", "", all_bulk_samples$gene)
+
+all_bulk_samples <- all_bulk_samples %>% filter(!duplicated(all_bulk_samples$gene))
+
+
+
+genes_names_df <- read.csv("genemes_names_df.csv")
+genes_names_df$X <- NULL
+genes_names_df <- na.omit(genes_names_df)
+all_bulk_samples <- all_bulk_samples[match(genes_names_df$gene_ids, all_bulk_samples$gene), ]
+all_bulk_samples <- na.omit(all_bulk_samples)
+all_bulk_samples <- subset(all_bulk_samples, gene %in% genes_names_df$gene_ids)
+genes_names_df <- genes_names_df[match(all_bulk_samples$gene, genes_names_df$gene_ids), ]
+
+all_bulk_samples <- na.omit(all_bulk_samples)
+all_bulk_samples$gene <- NULL
+
+
+# getting the rownames
+
+rownames(all_bulk_samples) <- genes_names_df$genes
+all_bulk_samples <- data.matrix(all_bulk_samples)
+any(is.na(all_bulk_samples))
+
+#making expressionset
+
+# for cortex data
+final_spinalled_ematrix <- all_bulk_samples
+write.csv(final_spinalled_ematrix, "bulk_cortex.csv")
+
+colnames(all_bulk_samples)[1] <- "gene"
+rownames(all_bulk_samples) <- all_bulk_samples$gene
+all_bulk_samples$gene <- NULL
+colnames(all_bulk_samples) <- gsub("[.]", "-", colnames(all_bulk_samples))
+
+```
+
+```{r}
+meta_data <- read.csv("metada.csv")
+
+als_mnd <- meta_data[meta_data$Subject.Group == "ALS Spectrum MND", ]
+als_mnd_sample_names <- als_mnd$X
+
+control <-  meta_data[meta_data$Subject.Group == "Non-Neurological Control", ]
+control_sample_names <- control$X
+```
+
+Deoconvulate with MuSiC
+```{r}
+# MuSiC
+bulk_control_healthy <- all_bulk_samples
+bulk_control_healthy <- bulk_control_healthy[, colnames(bulk_control_healthy) %in% c(control_sample_names, als_mnd_sample_names)]
+bulk_control_healthy <- bulk_control_healthy[, colnames(bulk_control_healthy) %in% cortex_samples]
+
+bulk_control_healthy <- na.omit(bulk_control_healthy)
+bulk_control_healthy <- as.matrix(bulk_control_healthy)
+prop_music_cortex =music_prop(bulk.mtx = bulk_control_healthy
+                      , sc.sce = singlecortex.sce,
+                      clusters = 'broad.cell.type', samples = 'TAG', verbose = F)
+
+
+saveRDS(prop_music_cortex, "CortexReferenceCortexEstimation_all.rds")
+
+```
+Plot the cell type estimations with jitter plot
+```{r}
+jitter.fig = Jitter_Est(list(data.matrix(prop_music$Est.prop.weighted),
+                             data.matrix(prop_music$Est.prop.allgene)),
+                        method.name = c('MuSiC', 'NNLS'), title = 'Jitter plot of Est Proportions')
+
+
+```
+
+```{r}
+music_predicted <- prop_music$Est.prop.weighted
+nnls_predicted <- prop_music$Est.prop.allgene
+
+
+ 
+prop_all_m = cbind('proportion'=c(music_predicted),'celltype'=rep(colnames(music_predicted), each=nrow(music_predicted)), 'sampleID'=rep(rownames(music_predicted),times=ncol(music_predicted)),'Method'='MuSiC')
+prop_all_n = cbind('proportion'=c(nnls_predicted),'celltype'=rep(colnames(nnls_predicted), each=nrow(nnls_predicted)), 'sampleID'=rep(rownames(nnls_predicted),times=ncol(nnls_predicted)),'Method'='NNLS')
+
+prop_all_m=as.data.frame(prop_all_m)
+prop_all_n=as.data.frame(prop_all_n)
+prop_all_m$proportion=as.numeric(as.character(prop_all_m$proportion))
+prop_all_n$proportion=as.numeric(as.character(prop_all_n$proportion))
+ALL=rbind(prop_all_m, prop_all_n)
+ALL$group = ifelse(ALL$sampleID %in% control_sample_names, 'Healthy', 'ALS')
+```
+
+Calculating P-Values
+
+```{r}
+# Subsetting to cortex samples alone
+
+meta_data_cortex <- subset(meta_data, grepl("Cortex", Sample.Source, ignore.case = TRUE))
+cortex_samples <- meta_data_cortex$X
+
+ALL <- ALL[ALL$sampleID %in% cortex_samples, ]
+ALL$p_nom <- pairwise.wilcox.test(x = ALL$proportion, g = ALL$group)$p.value[1]
+ALL$p_resid <- pairwise.wilcox.test(x = ALL$proportion, g = ALL$group)$p.value[1]
+```
+
+Calculating per cell type
+
+```{r}
+ALL <- ALL[!ALL$celltype == 'Opc', ]
+ALL <- ALL %>%
+  mutate(celltype = case_when(
+    celltype == "Oli" ~ "Oligodendrocytes",
+    celltype %in% c("In", "Ex") ~ "Neurons",
+    celltype == "Mic" ~ "Microglia",
+    celltype == "Ast" ~ "Astrocytes",
+    celltype == "End" ~ "Endothelial",
+    celltype == "Per" ~ "Pericytes",
+    TRUE ~ celltype 
+  ))
+```
+
+```{r}
+# linear model to account fo other factors
+meta_data_cortex <- meta_data_cortex[match(ALL$sampleID, meta_data_cortex$X), ]
+
+All_with_meta <- cbind(ALL, meta_data_cortex)
+All_with_meta$X <- NULL
+
+All_with_meta <- All_with_meta %>%
+  mutate(Sample.Source = ifelse(grepl("^Cortex_Frontal", Sample.Source), "Cortex_Frontal", Sample.Source))
+All_with_meta <- All_with_meta %>%
+  mutate(Sample.Source = ifelse(grepl("^Cortex_Motor", Sample.Source), "Cortex_Motor", Sample.Source))
+All_with_meta_NA <- na.omit(All_with_meta)
+mod <- lm( proportion ~ factor(Site.Specimen.Collected) +  factor(Prep) + factor(Platform), All_with_meta)
+
+All_with_meta$resid <-  residuals(mod)
+
+All_with_meta$p_resid <- pairwise.wilcox.test(x = All_with_meta$resid, g = All_with_meta$group)$p.value[1]
+```
+
+```{r}
+# Create an empty list to store the p-values for each cell type
+p_nom <- list()
+p_resid <- list()
+# Get unique cell types from the 'celltype' column
+unique_celltypes <- unique(All_with_meta$celltype)
+
+# Iterate over each unique cell type
+for (cell in unique_celltypes) {
+  # Subset the data for the current cell type
+  subset_data <- subset(All_with_meta, celltype == cell)
+  
+  # Perform pairwise Wilcoxon test for the current cell type
+  pairwise_result <- pairwise.wilcox.test(x = subset_data$proportion, g = subset_data$group)
+  residual_result <- pairwise.wilcox.test(x = subset_data$resid, g = subset_data$group)
+  # Extract the p-values and store them in the list
+  p_nom[[cell]] <- pairwise_result$p.value[1]
+  p_resid[[cell]] <- residual_result$p.value[1]
+}
+
+All_with_meta$p_nom <- NULL
+All_with_meta$p_resid <- NULL
+
+# store the p-values
+p_values_df <- data.frame(celltype = names(p_nom), p_nom = unlist(p_nom), p_resid = unlist(p_resid), stringsAsFactors = FALSE)
+
+# Merge the p_values_df with the ALL data frame
+All_with_meta <- merge(All_with_meta, p_values_df, by = "celltype", all.x = TRUE)
+
+```
+
+plotting the box_plot and p_Values
+
+```{r}
+
+library(ggplot2)
+
+# the boxplot
+plot <- ggplot(All_with_meta, aes(x = celltype, y = proportion, fill = group)) +
+  geom_boxplot(outlier.colour = NA) +
+  labs(x = "Cell Type", y = "Proportion", fill = "Group")
+
+# Add p-values as text above each cell type
+plot <- plot +
+  geom_text(data = All_with_meta[!duplicated(ALL$celltype), ],
+            aes(label = paste0("p = ", p_value)),
+            position = position_dodge(width = 0.35), vjust = -20)
+
+# Adjust the plot appearance
+plot <- plot +
+  theme_bw() +
+  theme(legend.position = "right", 
+        axis.text.x = element_text(angle = 45, hjust = 1),
+        plot.title = element_text(face = "bold"))
+
+# Display the plot
+plot
+
+```
+```{r}
+
+write.csv(All_with_meta, "final_cortex_estimations_with_p_values.csv")
+```
+
+Plotting in the style of Humphrey
+
+```{r}
+  
+p_df <- All_with_meta %>% 
+    group_by(celltype, Sample.Source) %>% 
+    summarise(p_nom = min(p_nom), p_resid = min(p_resid)) %>%
+    mutate(padj = p.adjust(p_resid, method = "bonferroni")) %>%
+    mutate(padj_label = case_when(
+    padj < 0.0001 ~ "***",
+    padj < 0.001 ~ "**",
+    padj < 0.05 ~ "*",
+    TRUE ~ "."
+    ))
+P_df_subset <- p_df[, c("celltype", "padj", "padj_label", "Sample.Source")]
+All_with_meta <- merge(All_with_meta, P_df_subset, by = c("celltype", "Sample.Source"), all.x = TRUE)
+All_with_meta <- All_with_meta[All_with_meta$Method == "MuSiC", ]
+```
+
+Saving all faceted image
+
+```{r}
+plot_all <- All_with_meta[All_with_meta$Sample.Source %in% c("Cortex_Frontal", "Cortex_Motor"), ] %>%
+  ggplot(aes(x = group, proportion)) +
+      geom_point(aes(colour = group),size = 0.5, position = position_jitter(width = 0.33, height = 0)) +
+    geom_boxplot(fill = NA,notch = FALSE, na.rm = TRUE, outlier.color = NA) +
+    facet_grid(Sample.Source ~ celltype,switch = "y" ) +
+    scale_colour_manual(values = c("#B61927", "#4F8FC4")) +
+    guides(fill = FALSE, colour = FALSE) +
+    theme(
+      panel.background = element_rect(fill = "white"),
+      strip.background = element_blank(),
+      strip.switch.pad.grid = unit(0,units ="pt"),
+      panel.spacing.x = unit(0,units = "pt"), 
+      strip.placement = "outside",
+      panel.border = element_blank(),
+      strip.text.x = element_text(face = "bold", hjust = 0.5, vjust = 1, margin = margin(t =5, b = 5, unit = "pt")),
+      strip.text.y.left = element_text(angle = 0),
+      plot.title = element_text(face = "bold"),
+      plot.margin = margin()
+    ) +
+    labs(x = "Sample Group", y = "Estimated Proportion", title = "Cell type estimations in Cortex from Cortex reference") +
+    scale_y_continuous(labels = scales::percent_format(accuracy = 1), limits = c(0,1)) + 
+    geom_text(nudge_x = 0.5, data = All_with_meta[All_with_meta$Sample.Source %in% c("Cortex_Frontal", "Cortex_Motor"), ], aes(x = 1, y = 0.9, label = padj_label) ) + theme_bw()
+ggsave(plot = plot_all, filename =  here::here("motor_frontal_cortex.jpeg"), width = 6, height = 3, dpi = 300)
+```
+
+Information about the total number of samples here
+
+```{r}
+sample_count <- ALL %>%
+  filter(!duplicated(ALL$sampleID)) %>%
+  group_by(group) %>%
+  summarise(count = n())
+```
+
+plot the overall box plot for each cell type here
+
+```{r}
+plot_all_cortex <- All_with_meta %>%
+  ggplot(aes(x = group, proportion)) +
+      geom_point(aes(colour = group),size = 0.5, position = position_jitter(width = 0.33, height = 0)) +
+    geom_boxplot(fill = NA,notch = FALSE, na.rm = TRUE, outlier.color = NA) +
+    facet_grid( ~ celltype,switch = "y" ) +
+    scale_colour_manual(values = c("#B61927", "#4F8FC4")) +
+    guides(fill = FALSE, colour = FALSE) +
+    theme(
+      strip.background = element_blank(),
+      strip.switch.pad.grid = unit(0,units ="pt"),
+      panel.spacing.x = unit(0,units = "pt"), 
+      strip.placement = "outside",
+      panel.border = element_blank(),
+      strip.text.x = element_text(face = "bold", hjust = 0.5, vjust = 1, margin = margin(t =5, b = 5, unit = "pt")),
+      strip.text.y.left = element_text(angle = 0),
+      plot.margin = margin()
+    ) +
+    labs(x = "Sample Group", y = "Estimated Proportion", title = "Overall Cell Type Estimations in Cortex") +
+    scale_y_continuous(labels = scales::percent_format(accuracy = 1), limits = c(0,1)) + 
+    geom_text(nudge_x = 0.5, data = p_df, aes(x = 1, y = 0.9, label = padj) ) + theme_bw()
+ggsave(plot = plot_all_cortex, filename =  here::here("ALL_cortex_all_atonce.jpeg"), width = 10, height = 3.5)
+```
