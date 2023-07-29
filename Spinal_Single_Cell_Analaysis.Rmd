@@ -1,0 +1,334 @@
+---
+title: "Single_cell_Analysis"
+author: "Nischal Bgandari"
+date: "6/7/2023"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+```{r include = FALSE}
+library(Seurat)
+library(SeuratWrappers)
+if (!requireNamespace("remotes", quietly = TRUE)) {
+  install.packages("remotes")
+}
+remotes::install_github("mojaveazure/seurat-disk")
+library(SeuratDisk)
+library(dplyr)
+library("monocle")
+```
+
+```{r cache=TRUE}
+seurat_file <- LoadH5Seurat("single_cell.h5seurat")
+```
+
+# Normalization already done
+
+Checking if the QC filtering was already done in the data
+```{r }
+seurat_file[['nCount_RNA']] <- seurat_file@meta.data[["n_counts"]]
+seurat_file[["nFeature_RNA"]] <- seurat_file@meta.data[["n_genes"]]
+seurat_file[["mt_content"]] <- PercentageFeatureSet(seurat_file, pattern = "^MT-" )
+VlnPlot(seurat_file, features = c("n_genes", "n_counts", "mt_content"), ncol = 3)
+```
+```{r}
+plot1 <- FeatureScatter(seurat_file, feature1 = "nCount_RNA", feature2 = "mt_content", raster = FALSE)
+```
+load the metadata 
+```{r}
+cell_types_file <- read.csv("single_cell_metadata.csv", header = TRUE)
+```
+
+Clean the metadata and match with single cell seurat file
+
+```{r}
+common_df <- cell_types_file
+colnames(common_df)[1] <- "cell_name"
+colnames(common_df)[2] <- "subtype"
+missing_cells <- setdiff(colnames(seurat_file), cell_types_file$X)
+missing_cells_df <- data.frame(cell_name = missing_cells, subtype = "Missing")
+
+final_cell_type <- rbind(common_df, missing_cells_df)
+final_cell_type_vec <- setNames(final_cell_type$subtype, final_cell_type$cell_name)
+```
+
+
+```{r}
+# add the metadata to the seurat object
+seurat_file <- AddMetaData(seurat_file, final_cell_type_vec, col.name = "Cell_Subtype")
+```
+
+
+Quality Controls
+Remove cells with > 10 percent of mitochondrial content and lower gene expression
+```{r}
+SpinalCord <- subset(seurat_file, subset = nFeature_RNA > 300 & mt_content < 10)
+```
+
+Feature Selection
+
+```{r include=FALSE cache=TRUE}
+SpinalCord <- FindVariableFeatures(SpinalCord, selection.method = "vst", nfeatures = 2000)
+```
+
+# identifying top 20 genes
+
+```{r top20}
+top20 <- head(VariableFeatures(SpinalCord), 20)
+```
+
+# Plotting the variable features
+
+plot variable features with and without labels
+
+```{r eval=TRUE, warning=FALSE}
+plot1 <- VariableFeaturePlot(SpinalCord)
+plot2 <- LabelPoints(plot = plot1, points = top20, repel = TRUE)
+plot1 | plot2
+```
+
+
+Scaling the data
+
+```{r cache=TRUE}
+SpinalCord <- ScaleData(SpinalCord)
+```
+
+Linear Dimension Reduction
+
+```{r cache=TRUE}
+SpinalCord <- RunPCA(SpinalCord)
+```
+
+Print the top genes associated with the first five PCs
+
+```{r eval=TRUE}
+print(SpinalCord[["pca"]], dims = 1:5, nfeatures = 6)
+```
+
+
+visualizing the pcas
+
+```{r warning=FALSE}
+pca_viz1 <- DimPlot(SpinalCord, reduction = "pca")
+pca_viz2 <- VizDimLoadings(SpinalCord, dims = 1:2, reduction = "pca")
+pca_viz1 | pca_viz2
+```
+Plot PCs with cell type
+
+```{r eval=TRUE}
+DimPlot(SpinalCord, reduction = 'pca', group.by = 'Cell_Subtype', label = T)
+```
+Visualing the cellular heterogeneity, important features
+cells and features here are plotted based on their PCA scores
+
+```{r eval=TRUE}
+DimHeatmap(SpinalCord, dims = 1:5, balanced = TRUE, cells = 500)
+```
+
+
+determining dimensionality 
+```{r}
+ElbowPlot(SpinalCord)
+```
+
+utpo 10 PCs account for good variance in the data 
+first 2 explain a lot of variance among cells
+
+
+Cell Clustering: Finding neighbors for cells
+
+```{r cache=TRUE}
+SpinalCord <- FindNeighbors(SpinalCord, dims = 1:10, )
+```
+
+Finding cluster of cells
+
+```{r cache=TRUE}
+SpinalCord <- FindClusters(SpinalCord, resolution = 0.8) # 0.4 - 1.2
+```
+```{r eval=TRUE}
+# first five cells and theirs clusters
+head(Idents(SpinalCord), 5)
+```
+
+
+Getting the total cell counts 
+
+```{r}
+length(Idents(SpinalCord))`
+```
+
+Non-Linear dimensionality reduction
+```{r cache=TRUE, warning=FALSE}
+SpinalCord <- RunUMAP(SpinalCord, dims = 1:10)
+```
+
+visualizing the labels: UMAPs
+```{r}
+DimPlot(SpinalCord, reduction = "umap", group.by = 'seurat_clusters', label=TRUE)
+```
+
+UMAPs with the Cell type clusters
+
+```{r}
+DimPlot(SpinalCord, reduction = "umap", group.by = 'Cell_Subtype', label=FALSE)
+```
+
+```{r savingfile}
+saveRDS(SpinalCord, "SpinalCord.rds")
+```
+```{r}
+spinal_cord <- readRDS("SpinalCord.rds")
+```
+
+```{r eval=TRUE, cache=TRUE}
+# find all markers of cluster 1 # only pos 
+cluster1.markers <- FindMarkers(SpinalCord, ident.1 = 1, min.pct = 0.25)
+head(cluster1.markers,  5)
+```
+Finding markers for each cluster
+
+```{r cache=TRUE, eval=TRUE}
+# find all markers
+all.markers <- FindAllMarkers(SpinalCord, only.pos = TRUE, min.pct = 0.25, logfc.threshold = 0.25)
+all.markers %>%
+    group_by(cluster) %>%
+    slice_max(n = 2, order_by = avg_log2FC)
+```
+
+```{r}
+# plotting some marker genes in each cell type
+VlnPlot(SpinalCord, features = c("SKI", "FAM155A", "EN01"))
+FeaturePlot(SpinalCord, features = c("SKI", "FAM155A", "EN01", "FAM189A2", "AC073941.1", "OBI1-AS1" ))
+```
+```{r}
+# labelling the clusters to the unique cell type
+# can by simply override with group.by == "cell_type" option in dimplot though
+
+cluster.names <- unique(cell_type)
+names(cluster.names) <- levels(SpinalCord)
+SpinalCord <- RenameIdents(SpinalCord, cluster.names)
+DimPlot(SpinalCord, reduction = "umap", label=TRUE, pt.size = 0.5) + NoLegend()
+```
+
+
+```{r}
+meta_data <- SpinalCordC@meta.data
+count <- meta_data %>%
+  group_by(Cell_Subtype) %>%
+  summarise(total = n())
+
+SpinalCordC <- spinal_cord 
+# collapse cell types with trailing characters into one. Astrocyte_1, Astrocyte_2 into Astrocyte
+SpinalCordC@meta.data[["Cell_Subtype"]] <- sub("_.*", "", SpinalCordC@meta.data[["Cell_Subtype"]])
+
+SpinalCordC@meta.data <- SpinalCordC@meta.data[SpinalCordC$Cell_Subtype %in% c("Astrocyte", "Endothelial","Excitatory", "Inhibitory", "Microglia", "Oligo"), ]
+```
+```{r}
+DimPlot(SpinalCordC, reduction = 'pca', group.by = 'Cell_Subtype', label = F)
+```
+Doing the same steps in the subset of single cell data ["Astrocyte", "Endothelial","Excitatory", "Inhibitory", "Microglia", "Oligo"]
+
+Use first 50 PCs to capture more variance in the data
+```{r}
+SpinalCordC <- FindNeighbors(SpinalCordC, dims = 1:50, )
+```
+
+```{r cache=TRUE}
+SpinalCordC <- FindClusters(SpinalCordC, resolution = 0.8) # 0.4 - 1.2
+```
+
+Non-Linear dimensionality reduction
+```{r cache=TRUE, warning=FALSE}
+SpinalCordC <- RunUMAP(SpinalCordC, dims = 1:50)
+```
+
+```{r}
+DimPlot(SpinalCordC, reduction = "umap", raster p)
+```
+```{r}
+# plot by other metadata variables
+DimPlot(SpinalCordC, reduction = 'umap', group.by = "Cell_Subtype", label = TRUE, raster = FALSE)
+```
+
+```{r}
+DimPlot(SpinalCordC, reduction = "umap", group.by = "patient", label = FALSE)
+```
+```{r segment}
+DimPlot(SpinalCordC, reduction = "umap", group.by = "segment", label = TRUE)
+```
+
+```{r cache=TRUE, eval=TRUE}
+# find all markers by cell type label
+all.markers <- FindAllMarkers(SpinalCordC, only.pos = TRUE, min.pct = 0.25, logfc.threshold = 0.25, max.cells.per.ident = 5000)
+```
+
+
+getting the top 10 markers for each cell type
+
+```{r}
+top10 <- all.markers %>%
+    group_by(cluster) %>%
+    slice_max(n = 10, order_by = avg_log2FC)
+```
+```{r}
+ggplot(top10, aes(top10$avg_log2FC, -log(top10$p_val), label = gene)) +
+  geom_point() +
+  geom_text(aes(label=ifelse(avg_log2FC>5,as.character(gene),'')),hjust=0,vjust=0, color = "red")
+```
+```{r}
+# plotting some of the markers for each cell type
+FeaturePlot(SpinalCordC, features = c("TMPRSS5", "DCC", "LINC01949", "CD14", "LINC02712", "EFHD1", "AQP1", "ARHGAP18","P4HA1"))
+VlnPlot(SpinalCordC, features = c("TMPRSS5", "DCC", "ARHGAP18","P4HA1"))
+```
+```{r}
+# setting identities for each cluster
+Idents(SpinalCordC) <- SpinalCordC@meta.data$Cell_Subtype
+levels(SpinalCordC)
+```
+```{r}
+all.markers %>%
+    group_by(cluster) %>%
+    top_n(n = 10, wt = avg_log2FC) -> top10
+DoHeatmap(SpinalCordC, features = top10$gene) + NoLegend()
+```
+
+```{r}
+DimPlot(SpinalCordC, reduction = 'umap', label = TRUE) + NoLegend()
+```
+
+```{r}
+library(ggplot2)
+segment <- data.frame(segment = SpinalCordC$segment)
+segment %>% group_by(segment) %>%
+  mutate(count = n())
+ggplot(segment, aes(x = segment)) +
+  geom_bar(stat = "count")
+```
+Counting number of cells per individual donor
+```{r}
+patient_cell_count <- data.frame(patient = SpinalCordC@meta.data$patient, segment = SpinalCordC@meta.data$segment)
+patient_cell_count <- patient_cell_count %>% group_by(patient, segment) %>%
+ count(patient)
+```
+plotting the cell counts
+```{r}
+ggplot(patient_cell_count, aes(patient,n, fill = segment)) +
+  geom_col()
+```
+
+UMAP plots for single cell reference
+
+```{r}
+p1 <- DimPlot(SpinalCordC, reduction = 'umap', group.by = 'segment', label = TRUE)
+p2 <- DimPlot(SpinalCordC, reduction = 'umap', group.by = 'patient', label = TRUE, legend =)
+p1|p2
+```
+
+Save the file
+```{r}
+final_spinal <- saveRDS(SpinalCordC, "SpinalCordCollapsed.rds")
+```
