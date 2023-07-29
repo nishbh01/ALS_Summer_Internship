@@ -1,0 +1,545 @@
+---
+title: "Single_Cell_Cortex and Bulk Cortex Deconvolution"
+author: "Nischal Bhandari"
+date: "7/11/2023"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+cortex_single <- readRDS("cortex_single_seurat.rds")
+```
+
+Deconvolution Using Cortex Sample
+
+```{r}
+library(MuSiC)
+library(MuSiC2)
+library(SCDC)
+library(SummarizedExperiment)
+library(tidyr)
+library(dplyr)
+library(ggplot2)
+```
+
+Relabelling the cell types
+```{r}
+cortex_single@meta.data <- cortex_single@meta.data %>%
+  mutate(broad.cell.type = case_when(
+     broad.cell.type == "Oli" ~ "Oligodendrocytes",
+    broad.cell.type %in% c("In", "Ex") ~ "Neurons",
+    broad.cell.type == "Mic" ~ "Microglia",
+    broad.cell.type == "Ast" ~ "Astrocytes",
+    broad.cell.type == "End" ~ "Endothelial",
+    broad.cell.type == "Per" ~ "Pericytes",
+    TRUE ~ broad.cell.type 
+  ))
+```
+
+
+
+```{r}
+# changing the single cell SO to SCE
+singlecortex.sce <- as.SingleCellExperiment(cortex_single)
+```
+```{r}
+# exploring single cell data
+p1 <- DimPlot(cortex_single, reduction = 'umap', group.by = "broad.cell.type", label = TRUE)
+p1 <- p1 + theme(legend.position = "NONE") +ggtitle("Cell types in cortex single cell reference")
+ggsave(p1, filename = "umap_cortex.jpeg", dpi = 300, height = 4, width = 6)
+```
+
+```{r}
+count_cell_type <- cortex_single@meta.data %>%
+  group_by(broad.cell.type) %>%
+  summarize(count = n())
+count_cell_type[order(count_cell_type$count, decreasing = TRUE), ]
+```
+Reading bulk data
+
+```{r}
+
+spinalled <- readRDS("bulk_spinal_expression_matrix.Rds")
+total_spinal_samples <- 928
+total_spinal_genes <- 34863
+
+
+final_spinalled_ematrix <- exprs(spinalled) #exprs(final_spinalled_ematrix)
+colnames(final_spinalled_ematrix) <- gsub("[.]", "-", colnames(final_spinalled_ematrix))
+
+```
+
+
+
+
+```{r}
+meta_data <- read.csv("metadata.csv")
+
+als_mnd <- meta_data[meta_data$Subject.Group == "ALS Spectrum MND", ]
+als_mnd_sample_names <- als_mnd$X
+
+control <-  meta_data[meta_data$Subject.Group == "Non-Neurological Control", ]
+control_sample_names <- control$X
+```
+
+
+```{r}
+
+# bulk_control <- final_spinalled_ematrix[, colnames(final_spinalled_ematrix) %in% control_sample_names]
+bulk_control <- final_spinalled_ematrix[, colnames(final_spinalled_ematrix) %in% control_sample_names]
+bulk_case <- final_spinalled_ematrix[, colnames(final_spinalled_ematrix) %in% als_mnd_sample_names]
+```
+
+# Estiimating with the MUSIC
+
+```{r}
+# MuSiC
+bulk_control_healthy <- final_spinalled_ematrix
+bulk_control_healthy <- bulk_control_healthy[, colnames(bulk_control_healthy) %in% c(control_sample_names, als_mnd_sample_names)]
+```
+
+```{r}
+bulk_control_healthy <- na.omit(bulk_control_healthy)
+bulk_control_healthy <- as.matrix(bulk_control_healthy)
+prop_music=music_prop(bulk.mtx = bulk_control_healthy, sc.sce = singlecortex.sce,
+                      clusters = 'broad.cell.type', samples = 'TAG', verbose = F)
+
+
+saveRDS(prop_music, "CortexReferenceSpinalEstimation.rds")
+```
+
+```{r}
+jitter.fig = Jitter_Est(list(data.matrix(prop_music$Est.prop.weighted),
+                             data.matrix(prop_music$Est.prop.allgene)),
+                        method.name = c('MuSiC', 'NNLS'), title = 'Jitter plot of Est Proportions in Spinal Samples from Cortex Reference')
+jitter.fig
+
+
+```
+
+```{r}
+music_predicted <- prop_music$Est.prop.weighted
+nnls_predicted <- prop_music$Est.prop.allgene
+
+
+ 
+prop_all_m = cbind('proportion'=c(music_predicted),'celltype'=rep(colnames(music_predicted), each=nrow(music_predicted)), 'sampleID'=rep(rownames(music_predicted),times=ncol(music_predicted)),'Method'='MuSiC')
+prop_all_n = cbind('proportion'=c(nnls_predicted),'celltype'=rep(colnames(nnls_predicted), each=nrow(nnls_predicted)), 'sampleID'=rep(rownames(nnls_predicted),times=ncol(nnls_predicted)),'Method'='NNLS')
+
+prop_all_m=as.data.frame(prop_all_m)
+prop_all_n=as.data.frame(prop_all_n)
+prop_all_m$proportion=as.numeric(as.character(prop_all_m$proportion))
+prop_all_n$proportion=as.numeric(as.character(prop_all_n$proportion))
+ALL=rbind(prop_all_m)
+ALL$group = ifelse(ALL$sampleID %in% control_sample_names, 'Healthy', 'ALS')
+```
+
+```{r}
+# validating the total number of samples in Healthy vs controls
+sample_count <- ALL %>%
+  group_by(group) %>%
+  summarise(count = n())
+# divide by 7. As there are 7 different cell types
+
+```
+
+Calculating P-Values
+
+```{r}
+# Subsetting to spinal samples alone
+
+meta_data_spinal <- subset(meta_data, grepl("spinal", Sample.Source, ignore.case = TRUE))
+spinal_samples <- meta_data_spinal$X
+
+ALL <- ALL[ALL$sampleID %in% spinal_samples, ]
+ALL$p_nom <- pairwise.wilcox.test(x = ALL$proportion, g = ALL$group)$p.value[1]
+```
+
+Calculating per cell type
+
+```{r}
+# ALL <- ALL[!ALL$celltype == 'Opc', ]
+ALL <- ALL %>%
+  mutate(celltype = case_when(
+    celltype == "Oli" ~ "Oligodendrocytes",
+    celltype %in% c("In", "Ex") ~ "Neurons",
+    celltype == "Mic" ~ "Microglia",
+    celltype == "Ast" ~ "Astrocytes",
+    celltype == "End" ~ "Endothelial",
+    celltype == "Per" ~ "Pericytes",
+    TRUE ~ celltype 
+  ))
+```
+dimensions of ALL: > dim(ALL)
+[1] 5236    6
+
+```{r}
+# linear model to account fo other factors
+meta_data_spinal <- meta_data_spinal[match(ALL$sampleID, meta_data_spinal$X), ]
+
+All_with_meta <- cbind(ALL, meta_data_spinal)
+All_with_meta$X <- NULL
+
+# it might be over fitting
+# mod <- lm( proportion ~ factor(Project) + factor(Site.Specimen.Collected) + factor(Family.History.of.ALS.FTD.)+ factor(Site.of.Motor.Onset) + factor(Sex) + factor(Sample.Source) + factor(Prep) + factor(Platform) + factor(Ethnicity), All_with_meta)
+mod <- lm( proportion ~ factor(Site.Specimen.Collected) +  factor(Platform), All_with_meta)
+
+All_with_meta$resid <-  residuals(mod)
+```
+ Calculating p - values [one normal wilcox paired-test, non-parametric, and other after regression modle--which will be shown in the graphs]
+ 
+
+```{r}
+# Create an empty list to store the p-values for each cell type
+p_nom <- list()
+p_resid <- list()
+# Get unique cell types from the 'celltype' column
+unique_celltypes <- unique(All_with_meta$celltype)
+
+# Iterate over each unique cell type
+for (cell in unique_celltypes) {
+  # Subset the data for the current cell type
+  subset_data <- subset(All_with_meta, celltype == cell)
+  
+  # Perform pairwise Wilcoxon test for the current cell type
+  pairwise_result <- pairwise.wilcox.test(x = subset_data$proportion, g = subset_data$group)
+  residual_result <- pairwise.wilcox.test(x = subset_data$resid, g = subset_data$group)
+  # Extract the p-values and store them in the list
+  p_nom[[cell]] <- pairwise_result$p.value[1]
+  p_resid[[cell]] <- residual_result$p.value[1]
+}
+
+All_with_meta$p_nom <- NULL
+All_with_meta$p_resid <- NULL
+
+# store the p-values
+p_values_df <- data.frame(celltype = names(p_nom), p_nom = unlist(p_nom), p_resid = unlist(p_resid), stringsAsFactors = FALSE)
+
+# Merge the p_values_df with the ALL data frame
+All_with_meta <- merge(All_with_meta, p_values_df, by = "celltype", all.x = TRUE)
+
+```
+
+plotting the box_plot and p_Values
+
+```{r}
+
+library(ggplot2)
+
+# the boxplot
+plot <- ggplot(All_with_meta, aes(x = celltype, y = proportion, fill = group)) +
+  geom_boxplot(outlier.colour = NA) +
+  labs(x = "Cell Type", y = "Estimated Proportion", fill = "Group", title = "Estimated Cell Type Proportions with Cortex Reference")
+
+# Add p-values as text above each cell type
+plot <- plot +
+  geom_text(data = All_with_meta[!duplicated(ALL$celltype), ],
+            aes(label = paste0("p = ", signif(p_resid, 3))),
+            position = position_dodge(width = 0.35), vjust = -20) +
+  scale_y_continuous(labels = scales::percent_format(accuracy = 1), limits = c(0,1))
+
+# Adjust the plot appearance
+plot <- plot +
+  theme_bw() +
+  theme(legend.position = "right", 
+        axis.text.x = element_text(angle = 45, hjust = 1),
+        plot.title = element_text(face = "bold"))
+
+# Display the plot
+plot
+
+```
+```{r}
+ggsave(plot = plot,"Estimation_with_p_value_all_cell_type.jpeg", height = 8, width = 8)
+write.csv(All_with_meta, "final_spinal_estimations_with_p_values.csv")
+```
+
+Plotting the graphs for cortex cell estimations with p-values
+
+```{r}
+  
+p_df <- All_with_meta %>% 
+    group_by(celltype, Sample.Source) %>% 
+    summarise(p_nom = min(p_nom), p_resid = min(p_resid)) %>%
+    mutate(padj = p.adjust(p_resid, method = "bonferroni")) %>%
+    mutate(padj_label = case_when(
+    padj < 0.0001 ~ "***",
+    padj < 0.001 ~ "**",
+    padj < 0.05 ~ "*",
+    TRUE ~ "."
+    ))
+P_df_subset <- p_df[, c("celltype", "padj", "padj_label", "Sample.Source")]
+All_with_meta <- merge(All_with_meta, P_df_subset, by = c("celltype", "Sample.Source"), all.x = TRUE)
+
+All_with_meta <- All_with_meta[All_with_meta$Method == "MuSiC", ]
+  
+```
+
+Saving all faceted image
+```{r}
+# calculating the median estimated proportions for each cell types
+
+median_prop <- All_with_meta %>%
+  group_by(celltype) %>%
+  summarise(median_prop = median(proportion))
+```
+# removing opcs as they are 0
+
+```{r}
+All_with_meta <- All_with_meta[!All_with_meta$celltype == "Opc", ]
+# removing spinal Unspecified as well
+All_with_meta <- All_with_meta[!All_with_meta$Sample.Source == "Spinal_Cord_Unspecified ", ]
+```
+```{r}
+plot_all <- All_with_meta %>%
+  ggplot(aes(x = group, y = proportion, colour = group)) +
+  geom_point(size = 0.5, position = position_jitter(width = 0.33, height = 0)) +
+  geom_boxplot(notch = FALSE, na.rm = TRUE, outlier.color = NA) +
+  facet_grid(Sample.Source ~ celltype, switch = "y") +
+  scale_colour_manual(values = c("#B61927", "#4F8FC4")) + 
+  guides(fill = FALSE, colour = guide_legend(override.aes = list(size = 2))) +
+  theme(
+    panel.background = element_rect(fill = "white"),
+    strip.background = element_blank(),
+    strip.switch.pad.grid = unit(0, units = "pt"),
+    panel.spacing.x = unit(0, units = "pt"), 
+    strip.placement = "outside",
+    panel.border = element_blank(),
+    strip.text.x = element_text(face = "bold", hjust = 0.5, vjust = 1, margin = margin(t = 5, b = 5, unit = "pt")),
+    strip.text.y.left = element_text(angle = 0),
+    axis.text.x = element_blank(),
+    axis.ticks.x = element_blank(),
+    legend.title = element_blank(),  # Remove the legend title
+    legend.position = "top",  # Position the legend at the top
+    legend.direction = "horizontal",  # Display the legend horizontally
+    legend.spacing = unit(0, "pt"),  # Remove spacing between legend items
+    plot.margin = margin()
+  ) +
+  labs(x = "", y = "Estimated Proportion", title = "Cell Type Estimations in Spinal From Cortex Reference") +
+  scale_y_continuous(labels = scales::percent_format(accuracy = 1), limits = c(0, 1)) + 
+  geom_text(nudge_x = 0.5, data = All_with_meta, aes(x = 1, y = 0.9, label = padj_label), color = "black")
+ggsave(plot = plot_all, filename =  here::here("ALL_spinal_no_unspecified.jpeg"), width = 8, height = 9)
+```
+
+Information about the total number of samples here
+
+```{r}
+sample_count <- ALL %>%
+  filter(!duplicated(ALL$sampleID)) %>%
+  group_by(group) %>%
+  summarise(count = n())
+
+# after dropping Spinal Cord Unspecified
+
+sample_count_no_unspecified <- All_with_meta %>%
+  filter(!duplicated(All_with_meta$sampleID)) %>%
+  group_by(group) %>%
+  summarise(count = n())
+```
+
+plot the overall box plot for each cell type here
+
+```{r}
+plot_all_spinal <- All_with_meta %>%
+  ggplot(aes(x = group, y = proportion, colour = group)) +
+  geom_point(size = 0.5, position = position_jitter(width = 0.33, height = 0)) +
+  geom_boxplot(notch = FALSE, na.rm = TRUE, outlier.color = NA, alpha = 0.0) +
+  facet_grid(~ celltype, switch = "x") +
+  scale_colour_manual(values = c("#B61927", "#4F8FC4")) + 
+  guides(fill = FALSE, colour = guide_legend(override.aes = list(size = 2))) +
+  theme(
+    panel.background = element_rect(fill = "white"),
+    strip.background = element_blank(),
+    strip.switch.pad.grid = unit(0, units = "pt"),
+    panel.spacing.x = unit(0, units = "pt"), 
+    strip.placement = "outside",
+    panel.border = element_blank(),
+    strip.text.x = element_text(face = "bold", hjust = 0.5, vjust = 1, margin = margin(t = 5, b = 5, unit = "pt")),
+    strip.text.y.left = element_text(angle = 0),
+    axis.text.x = element_blank(),
+    axis.ticks.x = element_blank(),
+    legend.title = element_blank(),  # Remove the legend title
+    legend.position = "top",  # Position the legend at the top
+    legend.direction = "horizontal",  # Display the legend horizontally
+    legend.spacing = unit(0, "pt"),  # Remove spacing between legend items
+    plot.margin = margin()
+  ) +
+  labs(x = "Cell Type", y = "Estimated Proportion", title = "Cell Type Estimations in Spinal From Cortex Reference") +
+  scale_y_continuous(labels = scales::percent_format(accuracy = 1), limits = c(0, 1)) + 
+  geom_text(nudge_x = 0.5, data = All_with_meta, aes(x = 1, y = 0.9, label = signif(padj, 3)), color = "black")
+plot_all_spinal <- plot_all_spinal + theme(plot.title = element_text(face = "bold"))
+
+ggsave(plot = plot_all_spinal, filename =  here::here("ALL_spinal_all_atonce.jpeg"), width = 10, height = 3.5)
+```
+
+
+Combining the meta_Data to look for covariates (platform and gender)
+
+```{r}
+bulk_spinal <- read.csv("final_spinal_estimations_with_p_values.csv")
+bulk_spinal$X <- NULL
+bulk_spinal <- subset(bulk_spinal, sampleID %in% c(als_mnd_sample_names, control_sample_names))
+bulk_spinal <- bulk_spinal[bulk_spinal$celltype != "Opc", ]
+```
+
+```{r}
+# calculating p-values for platform
+# Create an empty list to store the p-values for each cell type
+p_nom <- list()
+# Get unique cell types from the 'celltype' column
+unique_celltypes <- unique(bulk_spinal$celltype)
+
+# Iterate over each unique cell type
+for (cell in unique_celltypes) {
+  # Subset the data for the current cell type
+  subset_data <- subset(bulk_spinal, celltype == cell)
+  
+  # Perform pairwise Wilcoxon test for the current cell type
+  pairwise_result <- pairwise.wilcox.test(x = subset_data$proportion, g = subset_data$Platform)
+  # Extract the p-values and store them in the list
+  p_nom[[cell]] <- pairwise_result$p.value[1]
+}
+
+
+# store the p-values
+p_values_df <- data.frame(celltype = names(p_nom), p_nom = unlist(p_nom), stringsAsFactors = FALSE)
+```
+Platform 
+
+```{r}
+plot_platform <- bulk_spinal %>%
+  ggplot(aes(x = Platform, y = proportion, colour = Platform)) +
+  geom_point(size = 0.5, position = position_jitter(width = 0.33, height = 0)) +
+  geom_boxplot(notch = FALSE, na.rm = TRUE, outlier.color = NA, alpha = 0.3) +
+  facet_grid( ~ celltype, switch = "y") +
+  scale_colour_manual(values = c("#B61927", "#4F8FC4")) + 
+  guides(fill = FALSE, colour = guide_legend(override.aes = list(size = 2))) + labs(x = "", y = "Estimated Proportion", title = "Estimations differences across sequencing platforms") +
+  theme(plot.title = element_text(face = "bold"),
+    panel.background = element_rect(fill = "white"),
+    strip.background = element_blank(),
+    strip.switch.pad.grid = unit(0, units = "pt"),
+    panel.spacing.x = unit(0, units = "pt"), 
+    strip.placement = "outside",
+    panel.border = element_blank(),
+    strip.text.x = element_text(face = "bold", hjust = 0.5, vjust = 1, margin = margin(t = 5, b = 5, unit = "pt")),
+    strip.text.y.left = element_text(angle = 0),
+    axis.text.x = element_blank(),
+    axis.ticks.x = element_blank(),
+    legend.title = element_blank(),  
+    legend.position = "top",
+    legend.direction = "horizontal",
+    legend.spacing = unit(0, "pt"),
+    plot.margin = margin()
+  ) + 
+  scale_y_continuous(labels = scales::percent_format(accuracy = 1), limits = c(0, 1)) + 
+  geom_text(nudge_x = 0.5, data = p_values_df, aes(x = 1, y = 0.9, label = signif(p_nom, 3)), color = "black")
+ggsave(plot = plot_platform, "platforms_estimations.jpeg", dpi = 300, height = 3, width= 6)
+```
+
+For gender
+
+```{r}
+# calculating p-values for gender
+# delete previous lists
+p_nom <- list()
+# Get unique cell types from the 'celltype' column
+unique_celltypes <- unique(bulk_spinal$celltype)
+
+# Iterate over each unique cell type
+for (cell in unique_celltypes) {
+  # Subset the data for the current cell type
+  subset_data <- subset(bulk_spinal, celltype == cell)
+  
+  # Perform pairwise Wilcoxon test for the current cell type
+  pairwise_result <- pairwise.wilcox.test(x = subset_data$proportion, g = subset_data$Sex)
+  # Extract the p-values and store them in the list
+  p_nom[[cell]] <- pairwise_result$p.value[1]
+}
+
+
+# store the p-values
+p_values_df <- data.frame(celltype = names(p_nom), p_nom = unlist(p_nom), stringsAsFactors = FALSE)
+```
+
+```{r}
+plot2 <- bulk_spinal %>%
+  ggplot(aes(x = Sex, y = proportion, colour = Sex)) +
+  geom_point(size = 0.5, position = position_jitter(width = 0.33, height = 0)) +
+  geom_boxplot(notch = FALSE, na.rm = TRUE, outlier.color = NA, alpha = 0.3) +
+  facet_grid( ~ celltype, switch = "y") +
+  scale_colour_manual(values = c("#B61927", "#4F8FC4")) + 
+  guides(fill = FALSE, colour = guide_legend(override.aes = list(size = 2))) + labs(x = "", y = "Estimated Proportion", title = "Estimations differences across gender") +
+  theme(plot.title = element_text(face = "bold"),
+    panel.background = element_rect(fill = "white"),
+    strip.background = element_blank(),
+    strip.switch.pad.grid = unit(0, units = "pt"),
+    panel.spacing.x = unit(0, units = "pt"), 
+    strip.placement = "outside",
+    panel.border = element_blank(),
+    strip.text.x = element_text(face = "bold", hjust = 0.5, vjust = 1, margin = margin(t = 5, b = 5, unit = "pt")),
+    strip.text.y.left = element_text(angle = 0),
+    axis.text.x = element_blank(),
+    axis.ticks.x = element_blank(),
+    legend.title = element_blank(),  
+    legend.position = "top",
+    legend.direction = "horizontal",
+    legend.spacing = unit(0, "pt"),
+    plot.margin = margin()
+  ) + 
+  scale_y_continuous(labels = scales::percent_format(accuracy = 1), limits = c(0, 1)) + 
+  geom_text(nudge_x = 0.5, data = p_values_df, aes(x = 1, y = 0.9, label = signif(p_nom, 3)), color = "black")
+ggsave(plot = plot2, "Cortex_Spinal/gender_estimations.jpeg", dpi = 300, height = 3, width= 6)
+```
+
+Age at symptom onset
+
+```{r}
+correlation_coefficient <- cor(bulk_spinal$Age.at.Death, bulk_spinal$Age.at.Symptom.Onset, use = "complete.obs")
+p_value <- wilcox.test(bulk_spinal$Age.at.Death, bulk_spinal$Age.at.Symptom.Onset, paired = TRUE, alternative = "two.sided")
+p_value <- 2.2e-16
+
+plot3 <- ggplot(bulk_spinal, aes(Age.at.Symptom.Onset, Age.at.Death)) +
+  geom_point(color = "red", size = 1) + geom_smooth(method = "lm") + theme_classic() + labs(x = "Age at symptom onset", y = "Age at death", title = "Age at death vs symptom onset") + theme(plot.title = element_text(face = "bold"))
+
+```
+
+```{r}
+
+plot3 <- plot3 +
+  annotate(
+    "text", x = 30, y = 75,
+    label = paste("Pearson's r =", round(correlation_coefficient, 3)),
+    size = 4, hjust = 0, vjust = 0
+  ) +  annotate(
+    "text", x = 30, y = 70,
+    label = paste("p-value =", p_value),
+    size = 4, hjust = 0, vjust = 0)
+ggsave(plot = plot3, "age_corr.jpeg", dpi = 300, height = 3, width= 4)
+
+```
+
+```{r}
+correlation_coefficient <- cor(bulk_spinal$Age.at.Death, bulk_spinal$Disease.Duration.in.Months, use = "complete.obs")
+p_value <- wilcox.test(bulk_spinal$Age.at.Death, bulk_spinal$Disease.Duration.in.Months, paired = TRUE, alternative = "two.sided")
+p_value <- p_value$p.value
+
+plot4 <- ggplot(bulk_spinal, aes(Age.at.Symptom.Onset, Disease.Duration.in.Months)) +
+  geom_point(color = "red", size = 1) + geom_smooth(method = "lm") + theme_classic() + labs(x = "Age at symptom onset", y = "Disease duration (in months)", title = " Disease duration vs age at symptom onset") + theme(plot.title = element_text(face = "bold"))
+
+
+plot4 <- plot4 +
+  annotate(
+    "text", x = 30, y = 214,
+    label = paste("Pearson's r =", round(correlation_coefficient, 3)),
+    size = 4, hjust = 0, vjust = 0
+  ) +  annotate(
+    "text", x = 30, y = 200,
+    label = paste("p-value =", signif(p_value, 3)),
+    size = 4, hjust = 0, vjust = 0)
+
+
+ggsave(plot = plot4, "age_dur.jpeg", dpi = 300, height = 4, width= 5)
+```
