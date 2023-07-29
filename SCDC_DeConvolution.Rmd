@@ -1,0 +1,423 @@
+---
+title: "SCDC Bulk Spinal Cell Type Classification"
+author: "Nischal Bhandari"
+date: "6/15/2023"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+setwd("SCDC/")
+```
+Install SCDC
+```{r}
+if (!require("devtools")) {
+  install.packages("devtools")
+}
+devtools::install_github("meichendong/SCDC")
+```
+
+Load the libraries
+```{r}
+library(SCDC)
+library(Seurat)
+library(Biobase)
+
+# getting the bulk data
+spinal_bulk <- read.csv("Final_Spinal_with_Gene_names.csv")
+
+# prepare data and save table for cibersortX
+spinal_bulk <- na.omit(spinal_bulk)
+write.table(spinal_bulk, "bulk_cell_spinal_CIBERSORTx.txt", sep = "\t", quote = FALSE, row.names = FALSE, col.names = TRUE)
+
+rownames(spinal_bulk) <- spinal_bulk$X
+spinal_bulk$X <- NULL
+
+fdata <- rownames(spinal_bulk)
+pdata <- colnames(spinal_bulk)
+bulk_spinal_est <- readRDS("Spinal_ExpressionSet.Rds") # getESET(spinal_bulk, fdata = fdata, pdata = pdata)
+colnames(bulk_spinal_est) <- gsub("[.]", "-", colnames(bulk_spinal_est))
+
+saveRDS(spinal_eset, "Spinal_ExpressionSet.rds")
+
+
+class(spinal_eset)
+```
+
+
+```{r}
+# exploring single cell data
+spinal_single <- readRDS("Single_cell_SpinalCord.rds")
+
+spinal_single_est <- readRDS("Single_SpinalCord_expressionset.rds")
+
+# filtering out all the cell subtypes
+spinal_single$Cell_Subtype <- sub("_.*", "", spinal_single$Cell_Subtype)
+spinal_single <- subset(spinal_single, Cell_Subtype %in% c("Astrocyte", "Endothelial", "Excitatory", "Inhibitory", "Microglia", "Oligo"))
+unique(spinal_single$Cell_Subtype)
+
+# selecting only 2000 cells per cell subtype
+# Convert Seurat object to data frame
+
+# Create a list of cells to keep for each cell subtype
+# Add cell names as a new metadata column
+spinal_single[["cell_names"]] <- colnames(spinal_single)
+
+cells_to_keep <- spinal_single@meta.data %>%
+  group_by(Cell_Subtype) %>%
+  sample_n(min(n(), 2000))
+cells_to_keep <- cells_to_keep$cell_names
+# Get the row names from the data frame
+cells_to_keep <- cells_to_keep$cell_names
+
+# Subset the Seurat object using these cells
+subset_spinal_single <- subset(spinal_single, cells = cells_to_keep)
+saveRDS(subset_spinal_single, "subset_spinal_single_2000_per_cell_subtypes.Rds")
+```
+
+```{r}
+# converting seurat object into a ExpressionSet
+expressionData <- GetAssayData(spinal_single, slot = "data")
+
+expressionData <- as.matrix(expressionData)
+
+
+# calculate proportions for each cells type
+cell_type_proportions <- spinal_single_eset@phenoData@data %>%
+  group_by(Cell_Subtype) %>%
+  summarise(Proportion = n())
+
+
+
+cell_typed <- as.data.frame(spinal_single@meta.data)
+cell_typed <- subset(cell_typed, cell_typed$cell_names %in% cells_to_keep)
+
+# calculating the proportions for each cell type
+cell_type_proportions <- cell_typed %>%
+  group_by(Cell_Subtype, patient, segment) %>%
+  summarise(Proportion = n() / nrow(.))
+cell_type_proportions$Proportion <- 100 * cell_type_proportions$Proportion
+colnames(cell_type_proportions)[4] <- "Percentages"
+
+cell_typed <- cell_typed[match(colnames(expressionData), rownames(cell_typed)), ]
+colnames(expressionData) <- cell_typed$Cell_Subtype
+
+# storing the rownames in a column
+df <- data.frame(GeneSymbol = rownames(expressionData))
+
+expressionDatafiltered <- cbind(df, expressionData)
+expressionDatafiltered <- as.data.frame(expressionDatafiltered)
+
+# removing the rownames
+rownames(expressionDatafiltered) <- NUL
+
+
+
+
+# save the signature matrix for CIBERSORTx
+
+write.table(expressionDatafiltered, "single_cell_subset.txt", col.names = TRUE, row.names = FALSE, sep = "\t", quote = FALSE)
+# write to csv files
+write.csv(expressionData, "single_cell_humphrey_subset.csv")
+
+# add phenodata and feature data to expression set
+
+phenodata_single <- spinal_single@meta.data
+feature_data_single <- spinal_single@assays$RNA@meta.features
+spinal_single_eset <- ExpressionSet(assayData = expressionData)
+pData(spinal_single_eset) <- phenodata_single
+fData(spinal_single_eset) <- feature_data_single
+```
+
+```{r include=TRUE}
+# test file
+colors <- c("mediumorchid1", "mediumpurple1", "lightskyblue", "seagreen1", "yellow", "tan1", "azure3", "darkorange", "darkolivegreen1", "lightcoral", "mediumseagreen", "goldenrod1", "cornflowerblue", "plum1")
+
+DemoPlot(spinal_single_eset, cluster = "Cell_Subtype", sample = "patient", select.ct = c(
+  "Microglia", "Oligo", "Ependymal", "Opc", "T-cell", "Astrocyte", "Fibroblast", "Macrophage", "Proliferative",
+  "Endothelial", "Inhibitory", "B-cell", "Excitatory"
+), Palette = colors)
+```
+
+```{r warning=FALSE, echo=FALSE, results='hide'}
+# quality control
+single_cell.qc <- SCDC_qc(spinal_single_est,
+  ct.varname = "Cell_Subtype", sample = "patient", scsetname = "Single_Spinal",
+  ct.sub = c(
+    "Microglia", "Oligo", "Ependymal", "Opc", "T-cell", "Astrocyte", "Fibroblast", "Macrophage", "Proliferative",
+    "Endothelial", "Inhibitory", "B-cell", "Excitatory"
+  ), qcthreshold = 0.5
+)
+single_cell.qc$heatfig
+```
+```{r}
+# filtering only healthy and control
+
+bulk_spinal_est <- bulk_spinal_est[, colnames(bulk_spinal_est) %in% c(control_sample_names, als_mnd_sample_names)]
+```
+
+Running the bulk deconvolution in SCDC.
+```{r}
+bulk_cell_prop <- SCDC_prop(bulk_spinal_est, spinal_single_eset, ct.varname = "Cell_Subtype", sample = "patient", ct.sub = c(
+  "Microglia", "Oligo", "Ependymal", "Opc", "T-cell", "Astrocyte", "Fibroblast", "Macrophage", "Proliferative",
+  "Endothelial", "Inhibitory", "B-cell", "Excitatory"
+))
+```
+
+```{r}
+saveRDS(bulk_cell_prop, "SCDC_predictions.rds")
+```
+
+
+Get the estimations df from bulk_cell_prop
+```{r}
+SCDC_classification <- as.data.frame(bulk_cell_prop$prop.est.mvw)
+write.csv(SCDC_classification, "cell_type_classification.csv", row.names = TRUE)
+```
+
+
+```{r}
+# plotting graphs
+library(MuSiC)
+transposed_cell <- t(bulk_cell_prop[["yhat"]])
+jitter.fig <- Jitter_Est(list(bulk_cell_prop[["prop.est.mvw"]]),
+  method.name = "SCDC", title = "Jitter plot of Est Proportions : SCDC"
+)
+ggsave("cell_proportions.png")
+```
+```{r}
+# gene expression across cell types
+gene.fig <- Jitter_Est(list(bulk_cell_prop[["basis.mvw"]]),
+  method.name = "SCDC", title = "Jitter plot of gene expression in each cell type : SCDC"
+)
+ggsave("gene_proportions.png")
+
+
+
+# get the gene expression df from SCDC output
+gene_expression_df <- bulk_cell_prop[["basis.mvw"]]
+highly_expressed_genes <- gene_expression_df
+all_gene_names_highly_expressed <-
+  row.names(highly_expressed_genes)[which(highly_expressed_genes >= 5)]
+all_gene_names_highly_expressed <- all_gene_names_highly_expressed[!is.na(all_gene_names_highly_expressed)]
+highly_exressed_df <- gene_expression_df[rownames(gene_expression_df) %in% all_gene_names_highly_expressed, ]
+```
+
+Gene MALAT1 is highly expressed (>20) in all cell subtypes.
+
+Get heatmap for highly expressed genes
+```{r}
+melting_high_expression <- rbind(melt(highly_exressed_df))
+colnames(melting_high_expression) <- c("genes", "celltype", "MVA")
+heatmap(highly_exressed_df)
+library(heatmaply)
+heatmaply(highly_exressed_df)
+```
+```{r}
+# highly expressed genes with sample names
+high_expressed_genes_samples <- bulk_cell_prop[["yhat"]][rownames(bulk_cell_prop[["yhat"]]) %in% all_gene_names_highly_expressed, ]
+```
+
+generate graphs for cell type estimations with metadata/ covariates
+```{r}
+library(reshape2)
+all_cell_prop <- rbind(melt(bulk_cell_prop[["prop.est.mvw"]]))
+
+colnames(all_cell_prop) <- c("Samples", "CellType", "Prop")
+all_cell_prop$CellType <- factor(all_cell_prop$CellType)
+all_cell_prop$Samples <- gsub("[.]", "-", all_cell_prop$Samples)
+bulmeta_data <- read.csv("meta_data_for_bulk.csv")
+meta_data$X <- NULL
+meta_data <- meta_data[match(all_cell_prop$Samples, meta_data$Samples), ]
+all_cell_prop <- merge(all_cell_prop, meta_data, by = "Samples")
+```
+
+```{r}
+gene.fig.colored <- ggplot(all_cell_prop, aes(Family.History.of.ALS.FTD., Prop)) +
+  geom_point(aes(color = Subject.Group, shape = Sex),
+    size = 2, alpha = 0.7, position = position_jitter(width = 0.25, height = 0)
+  ) +
+  facet_wrap(~CellType, scales = "free") +
+  theme_minimal()
+```
+```{r}
+# highly expressed genes with sample names
+high_expressed_genes_samples <- bulk_cell_prop[["yhat"]][rownames(bulk_cell_prop[["yhat"]]) %in% all_gene_names_highly_expressed, ]
+high_expressed_genes_samples <- t(high_expressed_genes_samples)
+high_expressed_genes_samples <- as.data.frame(high_expressed_genes_samples)
+high_expressed_genes_samples$Samples <- rownames(high_expressed_genes_samples)
+rownames(high_expressed_genes_samples) <- NULL
+high_expressed_genes_samples$Samples <- gsub("[.]", "-", high_expressed_genes_samples$Samples)
+meta_data <- meta_data[match(high_expressed_genes_samples$Samples, meta_data$Samples), ]
+high_expressed_genes_samples_metada <- merge(high_expressed_genes_samples, meta_data, by = "Samples")
+write.csv(high_expressed_genes_samples_metada, "high_expressed_genes_samples_metada.csv")
+```
+
+```{r}
+# plotting highly expressed genes meta data
+ggplot(high_expressed_genes_samples_metada, aes(Subject.Group, fill = Sex)) +
+  geom_bar(stat = "count") +
+  coord_flip()
+```
+```{r}
+ggplot(high_expressed_genes_samples_metada, aes(Age.at.Death, Disease.Duration.in.Months)) +
+  geom_point(aes(color = Subject.Group))
+```
+
+```{r}
+ggplot(high_expressed_genes_samples_metada, aes(Age.at.Death, Age.at.Symptom.Onset)) +
+  geom_point(aes(color = Subject.Group))
+cor(high_expressed_genes_samples_metada$Age.at.Death, high_expressed_genes_samples_metada$Age.at.Symptom.Onset)
+```
+
+```{r}
+# all cells includeds
+ggplot(all_cell_prop, aes(Age.at.Death, Age.at.Symptom.Onset)) +
+  geom_point(aes(color = Subject.Group))
+
+ggplot(high_expressed_genes_samples_metada, aes(Age.at.Death, Disease.Duration.in.Months)) +
+  geom_point(aes(color = Subject.Group))
+```
+```{r}
+bulk_cell_prop[["No_MND"]] <- subset(all_cell_prop, all_cell_prop$Subject.Group == "Non-Neurological Control")
+bulk_cell_prop[["MND"]] <- subset(all_cell_prop, !(all_cell_prop$Subject.Group == "Non-Neurological Control"))
+# setting the search.length as 0.01 might take several minutes to finish the ENSEMBLE procedure.
+
+No_MND <- subset(all_cell_prop, all_cell_prop$Subject.Group == "Non-Neurological Control")
+MND <- subset(all_cell_prop, !(all_cell_prop$Subject.Group == "Non-Neurological Control"))
+```
+ 
+```{r}
+corr_mnd_no_mnd <- cor(all_cell_prop$Subject.Group == "Non-Neurological Control", !(all_cell_prop$Subject.Group == "Non-Neurological Control"))
+```
+```{r}
+ggplot(all_cell_prop, aes(Subject.Group, Prop)) +
+  geom_point(aes(color = Sex)) +
+  coord_flip() +
+  facet_wrap(~CellType)
+```
+```{r}
+ggplot(all_cell_prop, aes(Subject.Group, fill = CellType)) +
+  geom_bar(stat = "count") +
+  coord_flip()
+```
+```{r}
+# clustering
+rownames(high_expressed_genes_samples) <- high_expressed_genes_samples$Samples
+high_expressed_genes_samples$Samples <- NULL
+pca_high_expression_genes <- prcomp(high_expressed_genes_samples)
+pca_scores <- pca_high_expression_genes$x
+pca_scores <- pca_scores %>%
+  as_tibble(rownames = "sample")
+colnames(pca_scores)[1] <- "Samples"
+```
+
+```{r}
+# plotting pcas
+pca_scores %>%
+  ggplot(aes(x = PC1, y = PC2)) +
+  geom_point()
+
+pca_scores %>%
+  ggplot(aes(x = PC2, y = PC3)) +
+  geom_point()
+pca_scores %>%
+  ggplot(aes(x = PC3, y = PC4)) +
+  geom_point()
+```
+```{r}
+# merging metadata
+meta_data <- meta_data[match(meta_data$Samples, pca_scores$Samples), ]
+pca_scores_meta_data <- merge(pca_scores, meta_data, by = "Samples")
+```
+
+```{r}
+ggplot(pca_scores_meta_data, aes(x = PC1, y = PC2, color = Subject.Group)) +
+  geom_point()
+```
+
+```{r}
+ggplot(pca_scores_meta_data, aes(x = PC1, y = PC2, color = Sex)) +
+  geom_point()
+```
+
+
+```{r}
+# looking into genes
+genes <- pca_high_expression_genes$rotation
+genes <- genes %>%
+  as_tibble(rownames = "gene")
+
+# selecting only top 10 genes
+top10 <- genes %>%
+  select(gene, PC1, PC2) %>%
+  pivot_longer(matches("PC"), names_to = "PC", values_to = "loading") %>%
+  group_by(PC) %>%
+  arrange(desc(abs(loading))) %>%
+  head(10) %>%
+  pull(gene) %>%
+  unique()
+
+top_genes <- genes %>%
+  filter(gene %in% top10)
+
+# plotting the top10 genes
+top_10 <- ggplot(top_genes) +
+  geom_segment(aes(x = 0, y = 0, xend = PC2, yend = PC3),
+    arrow = arrow(length = unit(0.1, "in")),
+    colors = "brown"
+  ) +
+  geom_text(aes(x = PC1, y = PC2, label = gene),
+    nudge_y = 0.005, size = 3
+  ) +
+  scale_x_continuous(expand = c(0.02, 0.02))
+top_10
+```
+
+
+filtering out T-cells and B-Cells and running deconvolution again with refernce excluding t-and-b cells
+
+```{r}
+spinal_single_noT_B <- readRDS("subset_spinal_single_2000_per_cell_subtypes_no_missing.Rds")
+spinal_single_noT_B <- subset(spinal_single_noT_B, Cell_Subtype != "B-cell")
+spinal_single_noT_B <- subset(spinal_single_noT_B, Cell_Subtype != "T-cell")
+spinal_single_est <- spinal_single_est[spinal_single_est$Cell_Subtype != "B-cell"]
+```
+
+
+```{r}
+# converting into a ExpressionSet
+expressionData <- GetAssayData(spinal_single_noT_B, slot = "data")
+expressionData <- as.matrix(expressionData)
+phenodata_single <- spinal_single_noT_B@meta.data
+feature_data_single <- spinal_single_noT_B@assays$RNA@meta.features
+spinal_single_eset <- ExpressionSet(assayData = expressionData)
+pData(spinal_single_eset) <- phenodata_single
+fData(spinal_single_eset) <- feature_data_single
+saveRDS(spinal_single_eset, "single_spinal_eset_2000_per_cell_subtypes_no_t_B_cells.rds")
+```
+```{r}
+ct1 <- c("mediumorchid1", "mediumpurple1", "lightskyblue", "seagreen1", "yellow", "tan1", "azure3", "darkorange", "darkolivegreen1", "lightcoral", "mediumseagreen", "goldenrod1", "cornflowerblue", "plum1")
+
+DemoPlot(spinal_single_eset, cluster = "Cell_Subtype", sample = "patient", select.ct = c(
+  "Microglia", "Oligo", "Ependymal", "Opc", "T-cell", "Astrocyte", "Fibroblast", "Macrophage", "Proliferative",
+  "Endothelial", "Inhibitory", "B-cell", "Excitatory"
+), Palette = ct1)
+```
+
+```{r}
+# predicting
+bulk_cell_prop <- SCDC_prop(bulk_spinal_est, spinal_single_eset, ct.varname = "Cell_Subtype", sample = "patient", ct.sub = c(
+  "Microglia", "Oligo", "Ependymal", "Opc", "T-cell", "Astrocyte", "Fibroblast", "Macrophage", "Proliferative",
+  "Endothelial", "Inhibitory", "B-cell", "Excitatory"
+))
+```
+
+```{r}
+jitter.fig <- Jitter_Est(list(bulk_cell_prop[["prop.est.mvw"]]),
+  method.name = "SCDC", title = "Jitter plot of Est Proportions : SCDC"
+)
+```
