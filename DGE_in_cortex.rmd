@@ -1,0 +1,354 @@
+---
+title: "DGE analysis in Cortex"
+author: "Nischal Bhandari"
+date: "6/21/2023"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+```{r}
+setwd("Diff_Exp/")
+```
+
+Load the libraries
+```{r warning=FALSE}
+library(DESeq2)
+library(ggplot2)
+library(dplyr)
+```
+
+Load bulk RNA-seq and metadata
+
+```{r echo=FALSE, cache=TRUE}
+cortex_bulk <- read.csv("bulk_cortex.csv")
+rownames(cortex_bulk) <- cortex_bulk$X
+cortex_bulk$X <- NULL
+
+colnames(cortex_bulk) <- gsub("[.]", "-", colnames(cortex_bulk))
+
+# metadata
+meta_data <- read.csv("meta_data.csv")
+
+# clean the metadata for cortex
+
+meta_data_cortex <- subset(meta_data, grepl("Cortex", Sample.Source))
+
+meta_data_cortex <- meta_data_cortex %>%
+  mutate(Sample.Source = ifelse(grepl("^Cortex_Frontal", Sample.Source), "Cortex_Frontal", Sample.Source))
+meta_data_cortex <- meta_data_cortex %>%
+  mutate(Sample.Source = ifelse(grepl("^Cortex_Motor", Sample.Source), "Cortex_Motor", Sample.Source))
+
+meta_data_frontal <- meta_data_cortex[meta_data_cortex$Sample.Source == "Cortex_Frontal", ]
+meta_data_motor <- meta_data_cortex[meta_data_cortex$Sample.Source == "Cortex_Motor", ]
+```
+
+focusing differential gene expression in motor cortex only for now
+
+```{r}
+bulk_cortex <- cortex_bulk
+colnames(meta_data_motor)[1] <- "Samples"
+colnames(meta_data_frontal)[1] <- "Samples"
+bulk_cortex_motor <- bulk_cortex[, colnames(bulk_cortex) %in% meta_data_motor$Samples]
+bulk_cortex_frontal <- bulk_cortex[, colnames(bulk_cortex) %in% meta_data_frontal$Samples]
+bulk_cortex_motor$genes <- rownames(bulk_cortex_motor)
+bulk_cortex_motor <- bulk_cortex_motor %>%
+  select(genes, everything())
+
+rownames(bulk_cortex_motor) <- NULL
+countDataMatrix <- as.matrix(bulk_cortex_motor[, -1])
+rownames(countDataMatrix) <- bulk_cortex_motor[, 1]
+
+
+meta_data_motor <- meta_data_motor[match(colnames(countDataMatrix), meta_data_motor$Samples), ]
+
+rownames(meta_data_motor) <- meta_data_motor$Samples
+```
+
+```{r}
+# count motor cortex samples
+
+count_sample <- meta_data_motor %>%
+  group_by(Subject.Group) %>%
+  summarise(count = n())
+```
+
+```{r}
+# making sure the row names in colData matches to column names in counts_data
+all(colnames(countDataMatrix) %in% rownames(meta_data_motor))
+
+# are they in the same order?
+all(colnames(countDataMatrix) == rownames(meta_data_motor))
+ncol(countDataMatrix) == nrow(meta_data_motor)
+meta_data_motor <- as.matrix(meta_data_motor)
+# construct DESEQ dataset object
+library(SummarizedExperiment)
+bulk_motor_cortex_dds <- DESeqDataSetFromMatrix(
+  countData = round(countDataMatrix),
+  colData = meta_data_motor,
+  design = ~Subject.Group
+) # studying DGE in ALS vs control samples
+```
+
+```{r}
+bulk_motor_cortex_dds <- DESeq(bulk_motor_cortex_dds)
+
+saveRDS(bulk_motor_cortex_dds, "motor_cortex_deseq_obj_with_subject_group.rds")
+```
+
+
+Look at the results of DESeq
+
+```{r}
+# bulk_spinal_dds$Subject.Group <- factor(bulk_spinal_dds$Subject.Group, levels = c("ALS Spectrum MND", "Non-Neurological Control"))
+resultsNames(bulk_motor_cortex_dds)
+```
+
+```{r}
+# running differential expression in ALS Spectrum VS Control
+result_ALS_Sample_Source <- results(bulk_motor_cortex_dds, contrast = c("Subject.Group", "ALS Spectrum MND", "Non-Neurological Control"))
+head(result_ALS_Sample_Source, 10)
+```
+```{r}
+summary(result_ALS_Sample_Source)
+```
+
+```{r}
+result_ALS_Sample_Source <- result_ALS_Sample_Source[order(abs(result_ALS_Sample_Source$log2FoldChange), decreasing = TRUE), ]
+# result_ALS_Sample_Source <- subset(result_ALS_Sample_Source, padj < 0.001)
+head(result_ALS_Sample_Source, 20)
+top_20_regulated <- rownames(result_ALS_Sample_Source)
+# write.csv(as.data.frame(result_ALS_Sample_Source), "ALS_DESeq_result_Source_Result_Cervical.csv")
+```
+Plot the Volcanoplots
+
+```{r}
+# volcano plots with labels
+library("ggplot2")
+# seurat interfering with tidyr, so detaching it
+detach(package:Seurat)
+unloadNamespace("Seurat")
+library("ggrepel")
+
+ALS_genes_df <- as.data.frame(result_ALS_Sample_Source@listData)
+rownames(ALS_genes_df) <- rownames(result_ALS_Sample_Source)
+ALS_genes_df <- mutate(ALS_genes_df, sig = ifelse(result_ALS_Sample_Source$padj < 0.001, "padj<0.001", "Not Sig"))
+
+ALS_genes_df <- ALS_genes_df %>%
+  mutate(color = case_when(sig == "padj<0.001" & log2FoldChange > 0, "red",
+    sig == "padj<0.001" & log2FoldChange < 0, "blue",
+    .default = "gray"
+  ))
+
+
+ALS_genes_df <- cbind(gene = rownames(ALS_genes_df), ALS_genes_df)
+ALS_genes_df <- na.omit(ALS_genes_df)
+ALS_genes_df$intensity <- abs(ALS_genes_df$log2FoldChange)
+ALS_genes_df$color <- factor(ALS_genes_df$color)
+levels(ALS_genes_df$color)
+
+volc <- ggplot(ALS_genes_df, aes(log2FoldChange, -log10(pvalue))) +
+  geom_point(aes(col = color, alpha = intensity)) +
+  scale_color_manual(values = c("blue", "gray", "red")) +
+  scale_alpha_continuous(range = c(0.5, 1)) + # Adjust alpha range (0.5 to 1)
+  theme(
+    panel.background = element_rect(fill = "white"),
+    axis.line = element_line(linewidth = 0.5, color = "black"),
+    legend.position = "none"
+  ) + # Remove the legend
+  ggtitle("Highly Regulated Genes in Motor Cortex \n398 ALS vs 69 Controls") +
+  annotate("text",
+    x = Inf, y = Inf, hjust = 1, vjust = 1,
+    label = paste(
+      "Red: Upregulated", sum(ALS_genes_df$color == "red"), "\n",
+      "Blue: Downregulated", sum(ALS_genes_df$color == "blue"), "\n",
+      "Gray: Not Significant", sum(ALS_genes_df$color == "gray")
+    ),
+    size = 4
+  )
+volc + geom_text_repel(data = head(ALS_genes_df, 20), aes(label = gene)) # adding text for the top 20 genes
+volc
+
+# ordering by logfc
+ALS_genes_df <- ALS_genes_df[order(abs(ALS_genes_df$log2FoldChange), decreasing = TRUE), ]
+top_20_labels <- ggplot(ALS_genes_df, aes(log2FoldChange, -log10(pvalue))) +
+  geom_point(aes(col = color, alpha = intensity)) +
+  scale_color_manual(values = c("blue", "gray", "red")) +
+  scale_alpha_continuous(range = c(0.5, 1)) + # Adjust alpha range (0.5 to 1)
+  theme(
+    panel.background = element_rect(fill = "white"),
+    axis.line = element_line(linewidth = 0.5, color = "black"),
+    legend.position = "none"
+  ) + # Remove the legend
+  ggtitle("Highly Regulated Genes in Motor Cortex \n398 ALS vs 69 Controls") +
+  annotate("text",
+    x = Inf, y = Inf, hjust = 1, vjust = 1,
+    label = paste(
+      "Red: Upregulated", sum(ALS_genes_df$color == "red"), "\n",
+      "Blue: Downregulated", sum(ALS_genes_df$color == "blue"), "\n",
+      "Gray: Not Significant", sum(ALS_genes_df$color == "gray")
+    ),
+    size = 4
+  )
+top_10_down <- ALS_genes_df[ALS_genes_df$color == "blue", ]
+top_10_down <- head(top_10_down, 10)
+top_10_up <- ALS_genes_df[ALS_genes_df$color == "red", ]
+top_10_up <- head(top_10_up, 10)
+top_20 <- rbind(top_10_up, top_10_down)
+volc <- ggplot(ALS_genes_df, aes(log2FoldChange, -log10(pvalue))) +
+  geom_point(aes(col = color, alpha = intensity)) +
+  geom_text_repel(data = top_20, aes(label = gene), max.overlaps = Inf) + # Set max.overlaps to Inf
+  scale_color_manual(values = c("blue", "gray", "red")) +
+  scale_alpha_continuous(range = c(0.5, 1)) +
+  theme(
+    panel.background = element_rect(fill = "white"),
+    axis.line = element_line(linewidth = 0.5, color = "black"),
+    legend.position = "none"
+  ) +
+  ggtitle("Highly Regulated Genes in Motor Cortex \n\t\t398 ALS vs 69 Controls")
+```
+
+```{r}
+# saving the plot
+ggsave(volc, filename = "volcano_plot_of_motor_cortex.jpeg", dpi = 300)
+```
+
+Now, differential gene expression in frontal cortex
+
+```{r}
+# subset the data.
+bulk_cortex_frontal <- bulk_cortex[, colnames(bulk_cortex) %in% meta_data_frontal$Samples]
+
+# only include ALS and Controls subject group for computational efficiency
+meta_data_frontal <- meta_data_frontal[meta_data_frontal$Subject.Group %in% c("ALS Spectrum MND", "Non-Neurological Control"), ]
+
+bulk_cortex_frontal$genes <- rownames(bulk_cortex_frontal)
+bulk_cortex_frontal <- bulk_cortex_frontal %>%
+  select(genes, everything())
+
+
+rownames(bulk_cortex_frontal) <- NULL
+countDataMatrix_frotal <- as.matrix(bulk_cortex_frontal[, -1])
+rownames(countDataMatrix_frotal) <- bulk_cortex_frontal[, 1]
+
+
+meta_data_frontal <- meta_data_frontal[match(colnames(countDataMatrix_frotal), meta_data_frontal$Samples), ]
+
+rownames(meta_data_frontal) <- meta_data_frontal$Samples
+```
+
+```{r}
+# count motor cortex samples
+
+count_sample <- meta_data_frontal %>%
+  group_by(Subject.Group) %>%
+  summarise(count = n())
+```
+
+```{r}
+# making sure the row names in colData matches to column names in counts_data
+all(colnames(countDataMatrix_frotal) %in% rownames(meta_data_frontal))
+
+# are they in the same order?
+all(colnames(countDataMatrix_frotal) == rownames(meta_data_frontal))
+ncol(countDataMatrix_frotal) == nrow(meta_data_frontal)
+meta_data_frontal <- as.matrix(meta_data_frontal)
+# construct DESEQ dataset object
+library(SummarizedExperiment)
+bulk_frontal_cortex_dds <- DESeqDataSetFromMatrix(
+  countData = round(countDataMatrix_frotal), colData = meta_data_frontal,
+  design = ~Subject.Group
+)
+```
+
+```{r}
+bulk_frontal_cortex_dds <- DESeq(bulk_frontal_cortex_dds)
+
+saveRDS(bulk_frontal_cortex_dds, "frontal_cortex_deseq_obj_with_subject_group.rds")
+```
+
+
+# running differential expression in ALS Spectrum VS Control
+
+```{r}
+resultsNames(bulk_frontal_cortex_dds)
+```
+
+```{r}
+result_ALS_Frontal <- results(bulk_frontal_cortex_dds, contrast = c("Subject.Group", "ALS Spectrum MND", "Non-Neurological Control")) # pAdjustMethod = )
+head(result_ALS_Frontal, 10)
+```
+```{r}
+summary(result_ALS_Frontal)
+```
+
+```{r}
+result_ALS_Frontal <- result_ALS_Frontal[order(abs(result_ALS_Frontal$log2FoldChange), decreasing = TRUE), ]
+
+head(result_ALS_Frontal, 20)
+```
+
+
+```{r}
+# volcano plots with labels
+Frontal_ALS_genes_df <- as.data.frame(result_ALS_Frontal@listData)
+rownames(Frontal_ALS_genes_df) <- rownames(result_ALS_Frontal)
+Frontal_ALS_genes_df <- mutate(Frontal_ALS_genes_df, sig = ifelse(result_ALS_Sample_Source$padj < 0.001, "padj<0.001", "Not Sig"))
+
+Frontal_ALS_genes_df <- Frontal_ALS_genes_df %>%
+  mutate(color = ifelse(sig == "padj<0.001" & log2FoldChange > 0, "red",
+    ifelse(sig == "padj<0.001" & log2FoldChange < 0, "blue", "gray")
+  ))
+
+
+Frontal_ALS_genes_df <- cbind(gene = rownames(Frontal_ALS_genes_df), Frontal_ALS_genes_df)
+Frontal_ALS_genes_df <- na.omit(Frontal_ALS_genes_df)
+Frontal_ALS_genes_df$intensity <- abs(Frontal_ALS_genes_df$log2FoldChange)
+Frontal_ALS_genes_df$color <- factor(Frontal_ALS_genes_df$color)
+levels(Frontal_ALS_genes_df$color)
+
+
+# ordering by logfc
+Frontal_ALS_genes_df <- Frontal_ALS_genes_df[order(abs(Frontal_ALS_genes_df$log2FoldChange), decreasing = TRUE), ]
+top_20_flabels <- ggplot(Frontal_ALS_genes_df, aes(log2FoldChange, -log10(pvalue))) +
+  geom_point(aes(col = color, alpha = intensity)) +
+  scale_color_manual(values = c("blue", "gray", "red")) +
+  scale_alpha_continuous(range = c(0.5, 1)) + # Adjust alpha range (0.5 to 1)
+  theme(
+    panel.background = element_rect(fill = "white"),
+    axis.line = element_line(linewidth = 0.5, color = "black"),
+    legend.position = "none"
+  ) + # Remove the legend
+  ggtitle("Highly Regulated Genes in Frontal Cortex \n266 ALS vs 83 Controls") +
+  annotate("text",
+    x = Inf, y = Inf, hjust = 1, vjust = 1,
+    label = paste(
+      "Red: Upregulated", sum(ALS_genes_df$color == "red"), "\n",
+      "Blue: Downregulated", sum(ALS_genes_df$color == "blue"), "\n",
+      "Gray: Not Significant", sum(ALS_genes_df$color == "gray")
+    ),
+    size = 4
+  )
+top_10_down <- Frontal_ALS_genes_df[Frontal_ALS_genes_df$color == "blue", ]
+top_10_down <- head(top_10_down, 10)
+top_10_up <- Frontal_ALS_genes_df[Frontal_ALS_genes_df$color == "red", ]
+top_10_up <- head(top_10_up, 5)
+top_20 <- rbind(top_10_up, top_10_down)
+volc_f <- ggplot(Frontal_ALS_genes_df, aes(log2FoldChange, -log10(pvalue))) +
+  geom_point(aes(col = color, alpha = intensity)) +
+  geom_text_repel(data = top_20, aes(label = gene), max.overlaps = Inf) + # Set max.overlaps to Inf
+  scale_color_manual(values = c("blue", "gray", "red")) +
+  scale_alpha_continuous(range = c(0.5, 1)) +
+  theme(
+    panel.background = element_rect(fill = "white"),
+    axis.line = element_line(linewidth = 0.5, color = "black"),
+    legend.position = "none"
+  ) +
+  ggtitle("Highly Regulated Genes in Frontal Cortex \n\t\t266 ALS vs 83 Controls")
+```
+
+```{r}
+# saving the photo
+ggsave(volc_f, filename = "Diff_Exp/volcano_plot_of_frontal_cortex.jpeg", dpi = 300)
+```
