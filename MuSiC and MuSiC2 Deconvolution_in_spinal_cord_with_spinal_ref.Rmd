@@ -1,0 +1,538 @@
+---
+  title: "MuSiC_Bulk_Deconvolution"
+author: "Nischal Bhandari"
+date: "6/12/2023"
+output: html_document
+---
+  
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r warning=FALSE, include=FALSE}
+library(MuSiC)
+library(tidyverse)
+library(ggplot2)
+library(Biobase)
+library(Seurat)
+library(SingleCellExperiment)
+library(SummarizedExperiment)
+# install the MuSiC2 package
+if (!"MuSiC2" %in% rownames(installed.packages())) {
+  devtools::install_github("Jiaxin-Fan/MuSiC2")
+}
+library(MuSiC2)
+```
+```{r}
+setwd("MuSiC/")
+set.seed(1234)
+```
+```{r}
+# exploring single cell data
+spinal_single <- readRDS("Single_SpinalCord.rds")
+
+unique(spinal_single$Cell_Subtype)
+# filtering out all the cell subtypes that are labelled as "Missing" and others
+spinal_single$Cell_Subtype <- sub("_.*", "", spinal_single$Cell_Subtype)
+spinal_single <- subset(spinal_single, Cell_Subtype %in% c("Astrocyte", "Endothelial", "Excitatory", "Inhibitory", "Microglia", "Oligo"))
+
+# mergin the Excitatory and Inhibitory into neurons
+spinal_single@meta.data <- spinal_single@meta.data %>%
+  mutate(Cell_Subtype = case_when(
+    Cell_Subtype %in% c("Excitatory", "Inhibitory") ~ "Neurons",
+    TRUE ~ Cell_Subtype
+  ))
+```
+
+```{r}
+# exploring single cell data
+p1 <- DimPlot(spinal_single, reduction = "umap", group.by = "Cell_Subtype", label = TRUE, raster = FALSE)
+p1 <- p1 + theme(legend.position = "NONE") + ggtitle("Cell types in spinal single cell reference")
+ggsave(p1, filename = "umap_spinal.jpeg", dpi = 300, height = 4, width = 6)
+```
+
+```{r}
+count_cell_type <- spinal_single@meta.data %>%
+  group_by(Cell_Subtype, segment) %>%
+  summarize(count = n())
+count_cell_type[order(count_cell_type$count, decreasing = TRUE), ]
+```
+```{r}
+ggplot(count_cell_type, aes(Cell_Subtype, count, fill = segment)) +
+  geom_col() +
+  theme_bw()
+```
+
+
+```{r}
+# changing the single cell SO to SCE for MuSiC and MuSiC2.
+singlespinal.sce <- as.SingleCellExperiment(spinal_single)
+```
+
+```{r}
+# getting the gene names and ensemble IDS
+gene_names <- spinal_single@assays$RNA@meta.features
+gene_names <- gene_names[, -c(3:7)]
+```
+
+# cell proportions calculations
+
+```{r}
+# bulk data
+
+spinalled <- readRDS("bulk_expression_matrix.Rds")
+final_spinalled_ematrix <- exprs(spinalled)
+colnames(final_spinalled_ematrix) <- gsub("[.]", "-", colnames(final_spinalled_ematrix))
+```
+
+Getting control and ALS samples from meta_data
+
+```{r}
+meta_data <- read.csv("meta_data.csv")
+
+als_mnd <- meta_data[meta_data$Subject.Group == "ALS Spectrum MND", ]
+als_mnd_sample_names <- als_mnd$X
+
+control <- meta_data[meta_data$Subject.Group == "Non-Neurological Control", ]
+control_sample_names <- control$X
+```
+
+```{r}
+# inputs for music2 [control and case matrix]
+bulk_control <- final_spinalled_ematrix[, colnames(final_spinalled_ematrix) %in% control_sample_names]
+bulk_case <- final_spinalled_ematrix[, colnames(final_spinalled_ematrix) %in% als_mnd_sample_names]
+```
+Running MuSiC2 deconvolution
+```{r}
+library(rtracklayer)
+library(SummarizedExperiment)
+
+final_prop_est <- music2_prop_t_statistics(
+  bulk.control.mtx = bulk_control,
+  bulk.case.mtx = bulk_case, sc.sce = singlespinal.sce,
+  clusters = "Cell_Subtype", samples = "patient",
+  select.ct = c("Astrocyte", "Oligo", "Microglia", "Endothelial", "Excitatory", "Inhibitory"), n_resample = 20, sample_prop = 0.5, cutoff_c = 0.05, cutoff_r = 0.01
+)
+
+saveRDS(final_prop_est, "final_music2_prop_healthy_and_als.Rds")
+
+# get the estimation matrix from the MuSiC2.
+spinal_prop <- final_prop_est$Est.prop
+cell_type_specific_genes <- final_prop_est$DE.genes
+```
+
+Plot the results
+```{r}
+# plot estimated cell type proportions
+prop_all <- cbind("proportion" = c(spinal_prop), "sampleID" = rep(rownames(spinal_prop), times = ncol(spinal_prop)), "celltype" = rep(colnames(spinal_prop), each = nrow(spinal_prop)))
+
+prop_all <- as.data.frame(prop_all)
+prop_all$proportion <- as.numeric(as.character(prop_all$proportion))
+prop_all$group <- ifelse(prop_all$sampleID %in% als_mnd_sample_names, "ALS", "Healthy")
+prop_all$X <- NULL
+write.csv(prop_all, "als_helthy_proportion_music2.CSV")
+cols <- c("Microglia" = "cadetblue2", "Astrocyte" = "lightsalmon1", "Oligo" = "palegreen2", "Inhibitory" = "goldenrod1", "Excitatory" = "steelblue3")
+ggplot(prop_all, aes(x = celltype, y = proportion, color = celltype)) +
+  xlab("") +
+  geom_boxplot() +
+  geom_jitter(width = 0.25, alpha = 0.8) +
+  ylab("Cell Type Proportions") +
+  theme_bw() +
+  stat_summary(
+    fun = median,
+    geom = "crossbar", width = 0.5, size = 0.5, color = "red"
+  ) +
+  facet_grid(. ~ group) +
+  theme(
+    plot.title = element_text(hjust = 0.5, size = 12),
+    axis.text.x = element_text(size = 12, angle = 45, hjust = 1),
+    axis.text.y = element_text(size = 12),
+    axis.title.x = element_text(size = 12),
+    axis.title.y = element_text(size = 12),
+    axis.line = element_line(colour = "black"),
+    strip.text.x = element_text(size = 12),
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    panel.border = element_blank(),
+    panel.background = element_blank(),
+    legend.position = "none"
+  ) +
+  scale_color_manual(values = cols)
+```
+
+
+```{r}
+# music2 deconvolution with TOAST # not working
+set.seed(123)
+est_spinal <- music2_prop_toast(
+  bulk.control.mtx = bulk_control,
+  bulk.case.mtx = bulk_case, sc.sce = singlespinal.sce,
+  clusters = "Cell_Subtype", samples = "segment"
+)
+est.prop <- est$Est.prop
+```
+
+
+```{r}
+# adding a new column for the method used to make the estimations
+# this df will later be merged (rbinded) with estimations from other methods
+ALL <- cbind(prop_all[, -4], "Method" = "MuSiC2")
+```
+Run MuSiC deconvolution now.
+```{r}
+# Deconvoluting with MuSiC # doesn't need separate control and case matrix
+
+bulk_control_healthy <- final_spinalled_ematrix
+bulk_control_healthy <- bulk_control_healthy[, colnames(bulk_control_healthy) %in% c(control_sample_names, als_mnd_sample_names)]
+prop_music <- music_prop(
+  bulk.mtx = bulk_control_healthy, sc.sce = singlespinal.sce,
+  clusters = "Cell_Subtype", samples = "segment", verbose = F
+)
+saveRDS(prop_music, "MuSiC_NNLS_ALS_Healthy_Results_all.rds")
+
+# Music outputs NNLS and w-NNLS (MuSiC)
+music_predicted <- prop_music$Est.prop.weighted
+nnls_predicted <- prop_music$Est.prop.allgene
+
+
+# combine them all for side by side comparision
+prop_all_m <- cbind("proportion" = c(music_predicted), "celltype" = rep(colnames(music_predicted), each = nrow(music_predicted)), "sampleID" = rep(rownames(music_predicted), times = ncol(music_predicted)), "Method" = "MuSiC")
+prop_all_n <- cbind("proportion" = c(nnls_predicted), "celltype" = rep(colnames(nnls_predicted), each = nrow(nnls_predicted)), "sampleID" = rep(rownames(nnls_predicted), times = ncol(nnls_predicted)), "Method" = "NNLS")
+
+prop_all_m <- as.data.frame(prop_all_m)
+prop_all_n <- as.data.frame(prop_all_n)
+prop_all_m$proportion <- as.numeric(as.character(prop_all_m$proportion))
+prop_all_n$proportion <- as.numeric(as.character(prop_all_n$proportion))
+ALL <- rbind(ALL, prop_all_m, prop_all_n)
+
+ALL$group <- ifelse(ALL$sampleID %in% control_sample_names, "Healthy", "ALS")
+ALL$Method <- factor(ALL$Method, levels = c("MuSiC2", "MuSiC", "NNLS"))
+```
+
+Statistical Analysis here
+
+First of all, count the number of cell per group (control vs ALS)
+
+```{r}
+# validating the total number of samples in Healthy vs controls
+sample_count <- ALL %>%
+  group_by(group) %>%
+  summarise(count = n() / 5)
+# divide by 5. As there are 5 different cell types
+# each sample will have five rows (for each cell type)
+```
+
+Calculating P-Values
+
+```{r}
+# Subsetting to spinal samples alone
+
+meta_data_spinal <- subset(meta_data, grepl("spinal", Sample.Source, ignore.case = TRUE))
+spinal_samples <- meta_data_spinal$X
+
+ALL <- ALL[ALL$sampleID %in% spinal_samples, ]
+```
+
+Calculating per cell type
+
+```{r}
+# renaming oligo
+ALL <- ALL %>%
+  mutate(celltype = case_when(
+    celltype == "Oligo" ~ "Oligodendrocytes",
+    TRUE ~ celltype
+  ))
+```
+dimensions of ALL: > dim(ALL)
+[1] 3740    5
+
+```{r}
+# linear model to account fo other factors
+meta_data_spinal <- meta_data_spinal[match(ALL$sampleID, meta_data_spinal$X), ]
+
+All_with_meta <- cbind(ALL, meta_data_spinal)
+All_with_meta$X <- NULL
+
+# control of technical variables
+mod <- lm(proportion ~ factor(Site.Specimen.Collected) + factor(Platform), All_with_meta)
+
+All_with_meta$resid <- residuals(mod)
+```
+
+ Calculating p - values [one normal wilcox paired-test, non-parametric, and other after regression model--which will be shown in the graphs]
+ 
+
+```{r}
+# Create an empty list to store the p-values for each cell type
+p_nom <- list()
+p_resid <- list()
+# Get unique cell types from the 'celltype' column
+unique_celltypes <- unique(All_with_meta$celltype)
+
+# Iterate over each unique cell type
+for (cell in unique_celltypes) {
+  # Subset the data for the current cell type
+  subset_data <- subset(All_with_meta, celltype == cell)
+
+  # Perform pairwise Wilcoxon test for the current cell type
+  pairwise_result <- pairwise.wilcox.test(x = subset_data$proportion, g = subset_data$group)
+  residual_result <- pairwise.wilcox.test(x = subset_data$resid, g = subset_data$group)
+  # Extract the p-values and store them in the list
+  p_nom[[cell]] <- pairwise_result$p.value[1]
+  p_resid[[cell]] <- residual_result$p.value[1]
+}
+
+All_with_meta$p_nom <- NULL
+All_with_meta$p_resid <- NULL
+
+# store the p-values
+p_values_df <- data.frame(celltype = names(p_nom), p_nom = unlist(p_nom), p_resid = unlist(p_resid), stringsAsFactors = FALSE)
+
+# Merge the p_values_df with the ALL data frame
+All_with_meta <- merge(All_with_meta, p_values_df, by = "celltype", all.x = TRUE)
+```
+
+plotting the box_plot and p_Values
+
+```{r}
+library(ggplot2)
+
+# the boxplot
+plot <- ggplot(All_with_meta, aes(x = celltype, y = proportion, fill = group)) +
+  geom_boxplot(outlier.colour = NA) +
+  labs(x = "Cell Type", y = "Estimated Proportion", fill = "Group", title = "Estimated Spinal Cord Cell Type Proportions with Spinal Reference")
+
+# Add p-values as text above each cell type
+plot <- plot +
+  geom_text(
+    data = All_with_meta[!duplicated(ALL$celltype), ],
+    aes(label = paste0("p = ", signif(p_resid, 3))),
+    position = position_dodge(width = 0.35), vjust = -25
+  ) +
+  scale_y_continuous(labels = scales::percent_format(accuracy = 1), limits = c(0, 1))
+
+# Adjust the plot appearance
+plot <- plot +
+  theme_bw() +
+  theme(
+    legend.position = "right",
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    plot.title = element_text(face = "bold")
+  )
+
+# Display the plot
+plot
+```
+
+```{r}
+ggsave(plot = plot, "Estimation_with_p_value_all_cell_type.jpeg", height = 8, width = 8)
+
+write.csv(All_with_meta, "final_spinal_estimations_with_p_values_All_methods.csv")
+```
+
+Plotting the p-values
+
+```{r}
+p_df <- All_with_meta %>%
+  group_by(celltype, Sample.Source) %>%
+  summarise(p_nom = min(p_nom), p_resid = min(p_resid)) %>%
+  mutate(padj = p.adjust(p_resid, method = "bonferroni")) %>%
+  mutate(padj_label = case_when(
+    padj < 0.0001 ~ "***",
+    padj < 0.001 ~ "**",
+    padj < 0.05 ~ "*",
+    TRUE ~ "."
+  ))
+P_df_subset <- p_df[, c("celltype", "padj", "padj_label", "Sample.Source")]
+All_with_meta <- merge(All_with_meta, P_df_subset, by = c("celltype", "Sample.Source"), all.x = TRUE)
+
+All_with_meta <- All_with_meta[All_with_meta$Method == "MuSiC", ]
+```
+
+Saving all faceted image
+```{r}
+# calculating the median estimated proportions for each cell types
+
+median_prop <- All_with_meta %>%
+  group_by(celltype) %>%
+  summarise(median_prop = median(proportion))
+```
+# removing opcs as they are 0
+
+```{r}
+# removing spinal Unspecified as well
+All_with_meta <- All_with_meta[!All_with_meta$Sample.Source == "Spinal_Cord_Unspecified ", ]
+```
+
+# plot every part of spinal cord expect unspecified samples
+```{r}
+plot_all <- All_with_meta %>%
+  ggplot(aes(x = group, y = proportion, colour = group)) +
+  geom_point(size = 0.5, position = position_jitter(width = 0.33, height = 0)) +
+  geom_boxplot(notch = FALSE, na.rm = TRUE, outlier.color = NA) +
+  facet_grid(Sample.Source ~ celltype, switch = "y") +
+  scale_colour_manual(values = c("#B61927", "#4F8FC4")) +
+  guides(fill = FALSE, colour = guide_legend(override.aes = list(size = 2))) +
+  theme(
+    panel.background = element_rect(fill = "white"),
+    strip.background = element_blank(),
+    strip.switch.pad.grid = unit(0, units = "pt"),
+    panel.spacing.x = unit(0, units = "pt"),
+    strip.placement = "outside",
+    panel.border = element_blank(),
+    strip.text.x = element_text(face = "bold", hjust = 0.5, vjust = 1, margin = margin(t = 5, b = 5, unit = "pt")),
+    strip.text.y.left = element_text(angle = 0),
+    axis.text.x = element_blank(),
+    axis.ticks.x = element_blank(),
+    legend.title = element_blank(), # Remove the legend title
+    legend.position = "top", # Position the legend at the top
+    legend.direction = "horizontal", # Display the legend horizontally
+    legend.spacing = unit(0, "pt"), # Remove spacing between legend items
+    plot.margin = margin()
+  ) +
+  labs(x = "", y = "Estimated Proportion", title = "Cell Type Estimations in Spinal From Spinal Reference") +
+  scale_y_continuous(labels = scales::percent_format(accuracy = 1), limits = c(0, 1)) +
+  geom_text(nudge_x = 0.5, data = All_with_meta, aes(x = 1, y = 0.9, label = padj_label), color = "black")
+ggsave(plot = plot_all, filename = here::here("estimations_spinal_3sections_no_unspecified.jpeg"), width = 8, height = 9)
+```
+
+Information about the total number of samples here
+
+```{r}
+sample_count <- ALL %>%
+  filter(!duplicated(ALL$sampleID)) %>%
+  group_by(group) %>%
+  summarise(count = n())
+
+# after dropping Spinal Cord Unspecified
+
+sample_count_no_unspecified <- All_with_meta %>%
+  filter(!duplicated(All_with_meta$sampleID)) %>%
+  group_by(group) %>%
+  summarise(count = n())
+```
+
+plot the overall box plot for each cell type here (no thoracic)
+
+```{r}
+plot_all <- All_with_meta[All_with_meta$Sample.Source %in% c("Spinal_Cord_Cervical", "Spinal_Cord_Lumbar"), ] %>%
+  ggplot(aes(x = group, proportion)) +
+  geom_point(aes(colour = group), size = 0.5, position = position_jitter(width = 0.33, height = 0)) +
+  geom_boxplot(fill = NA, notch = FALSE, na.rm = TRUE, outlier.color = NA) +
+  facet_grid(Sample.Source ~ celltype, switch = "y") +
+  scale_colour_manual(values = c("#B61927", "#4F8FC4")) +
+  guides(fill = FALSE, colour = FALSE) +
+  theme(
+    panel.background = element_rect(fill = "white"),
+    strip.background = element_blank(),
+    strip.switch.pad.grid = unit(0, units = "pt"),
+    panel.spacing.x = unit(0, units = "pt"),
+    strip.placement = "outside",
+    panel.border = element_blank(),
+    strip.text.x = element_text(face = "bold", hjust = 0.5, vjust = 1, margin = margin(t = 5, b = 5, unit = "pt")),
+    strip.text.y.left = element_text(angle = 0),
+    plot.title = element_text(face = "bold"),
+    plot.margin = margin()
+  ) +
+  labs(x = "Sample Group", y = "Estimated Proportion", title = "Cell type estimations in Spinal cord from Spinal reference") +
+  scale_y_continuous(labels = scales::percent_format(accuracy = 1), limits = c(0, 1)) +
+  geom_text(nudge_x = 0.5, data = All_with_meta[All_with_meta$Sample.Source %in% c("Spinal_Cord_Cervical", "Spinal_Cord_Lumbar"), ], aes(x = 1, y = 0.9, label = padj_label)) +
+  theme_bw()
+plota_all <- plot_all + theme(plot.title = element_text(face = "bold"))
+ggsave(plot = plot_all, filename = here::here("lumbar_cervical_spinal_all_atonce.jpeg"), width = 6, height = 4, dpi = 300)
+```
+
+Plot one pair of bars per cell type across all of lumbar, cervical, thoracic at once
+
+```{r}
+plot_all_spinal <- All_with_meta %>%
+  ggplot(aes(x = group, y = proportion, colour = group)) +
+  geom_point(size = 0.5, position = position_jitter(width = 0.33, height = 0)) +
+  geom_boxplot(notch = FALSE, na.rm = TRUE, outlier.color = NA, alpha = 0.0) +
+  facet_grid(~celltype, switch = "x") +
+  scale_colour_manual(values = c("#B61927", "#4F8FC4")) +
+  guides(fill = FALSE, colour = guide_legend(override.aes = list(size = 2))) +
+  theme(
+    panel.background = element_rect(fill = "white"),
+    strip.background = element_blank(),
+    strip.switch.pad.grid = unit(0, units = "pt"),
+    panel.spacing.x = unit(0, units = "pt"),
+    strip.placement = "outside",
+    panel.border = element_blank(),
+    strip.text.x = element_text(face = "bold", hjust = 0.5, vjust = 1, margin = margin(t = 5, b = 5, unit = "pt")),
+    strip.text.y.left = element_text(angle = 0),
+    axis.text.x = element_blank(),
+    axis.ticks.x = element_blank(),
+    legend.title = element_blank(), # Remove the legend title
+    legend.position = "top", # Position the legend at the top
+    legend.direction = "horizontal", # Display the legend horizontally
+    legend.spacing = unit(0, "pt"), # Remove spacing between legend items
+    plot.margin = margin()
+  ) +
+  labs(x = "Cell Type", y = "Estimated Proportion", title = "Cell Type Estimations in Spinal From Spinal Reference") +
+  scale_y_continuous(labels = scales::percent_format(accuracy = 1), limits = c(0, 1)) +
+  geom_text(nudge_x = 0.5, data = All_with_meta, aes(x = 1, y = 0.9, label = signif(padj, 3)), color = "black")
+plot_all_spinal <- plot_all_spinal + theme(plot.title = element_text(face = "bold"))
+ggsave(plot = plot_all_spinal, filename = here::here("ALL_spinal_all_atonce.jpeg"), width = 10, height = 3.5)
+```
+Plotting all methods
+
+```{r}
+p1 <- ggplot(ALL, aes(celltype, proportion, fill = group)) +
+  geom_boxplot(color = "black", outlier.shape = NA) +
+  facet_wrap(~Method) +
+  theme(axis.text.x = element_text(size = 12, angle = 45, hjust = 1))
+```
+
+
+```{r}
+summary_table <- ALL %>%
+  group_by(celltype, Method, group) %>%
+  summarise(median = median(proportion), n = n())
+```
+
+Watch for covariates
+
+```{r}
+meta_data <- read.csv("meta_data.csv")
+
+meta_data_spinal <- meta_data[grep("^Spinal", meta_data$Sample.Source, ignore.case = TRUE), ]
+colnames(meta_data_spinal)[1] <- "sampleID"
+
+count_of_sample <- meta_data_spinal %>%
+  group_by(Subject.Group) %>%
+  summarise(count = n())
+
+meta_data_spinal <- meta_data_spinal[match(ALL$sampleID, meta_data_spinal$sampleID), ]
+
+All_with_meta <- cbind(ALL, meta_data_spinal)
+All_with_meta <- All_with_meta[, -2] # has duplicate columns for sampleID
+```
+
+visualizing cell type, proportion with resepct to Sample.Souce
+```{r}
+# visualizing cell type, proportion with resepct to Sample.Souce
+ggplot(All_with_meta, aes(x = celltype, y = proportion, color = Sample.Source)) +
+  xlab("") +
+  geom_boxplot(outlier.shape = NA) +
+  facet_grid(. ~ Method) +
+  theme(
+    plot.title = element_text(hjust = 0.5, size = 12),
+    axis.text.x = element_text(size = 12, angle = 45, hjust = 1),
+    axis.text.y = element_text(size = 12),
+    axis.title.x = element_text(size = 12),
+    axis.title.y = element_text(size = 12),
+    axis.line = element_line(colour = "black"),
+    strip.text.x = element_text(size = 12),
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    panel.border = element_blank(),
+    panel.background = element_blank(),
+    legend.position = "right"
+  )
+```
+```{r}
+sample_source_count <- All_with_meta %>%
+  group_by(Sample.Source) %>%
+  summarise(total_sample = n())
+```
